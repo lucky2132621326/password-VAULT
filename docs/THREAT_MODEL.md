@@ -1,16 +1,18 @@
 # AEGIS — Threat Model
 
-Scope: the Chrome extension (`apps/chrome-extension`) and Windows desktop
-assistant (`apps/desktop`), plus the shared crypto/vault layer
-(`packages/shared`) they both build on.
+Scope: the FastAPI authentication service (`backend`), web client
+(`frontend`), Chrome extension (`apps/chrome-extension`), Windows desktop
+assistant (`apps/desktop`), and shared crypto/vault layer (`packages/shared`).
 
 ---
 
 ## Security goal
 
-**An attacker who obtains the stored data — by dumping the database, reading
-`chrome.storage.local`, copying the desktop app's files, or compromising a
-future backend server — learns nothing about any password.**
+**An attacker who takes over an account session or obtains stored data — by
+dumping a database, reading `localStorage`/`chrome.storage.local`, copying the
+desktop files, or compromising the backend — still cannot decrypt vault
+passwords without the independent vault master password or user-held vault
+recovery key.**
 
 Everything below follows from that one goal.
 
@@ -18,10 +20,11 @@ Everything below follows from that one goal.
 
 | Boundary | Trusted? | Why |
 |---|---|---|
-| User's typed master password | Trusted at the moment of entry | Unavoidable — this is the root of all key material |
-| Derived AES-256 key, in process memory | Trusted while unlocked | Held only in a module-level variable; dropped on lock/exit |
-| Persisted storage (`chrome.storage.local`, desktop JSON files, future DB) | **Untrusted** | Assumed readable by an attacker; only ever contains ciphertext |
-| A future FastAPI backend | **Untrusted** | Same assumption — it stores blobs it cannot decrypt |
+| Account password + TOTP | Trusted by the auth service during verification | Proves account control but grants no decryption capability |
+| User's typed vault master password | Trusted at the moment of entry | Used locally only to unwrap the random vault key |
+| Random AES-256 vault key, in process memory | Trusted while unlocked | Non-extractable after import; dropped on lock/exit |
+| Persisted storage (`localStorage`, `chrome.storage.local`, desktop JSON, backend DB) | **Untrusted** | Assumed readable by an attacker; stored passwords and vault secrets are ciphertext |
+| FastAPI backend | **Untrusted for vault secrets** | Stores auth state, wrapped profiles, and encrypted items, but no vault key/material |
 | Administrators | **Untrusted for secrets** | Can manage lifecycle and policy; cannot decrypt any credential |
 | The web page a content script runs in | **Untrusted** | Isolated world; page scripts cannot reach extension state |
 | Other desktop processes | **Untrusted** | Identity must be verified before any insertion |
@@ -31,11 +34,14 @@ Everything below follows from that one goal.
 
 ## Assets
 
-1. Master passwords — never persisted, never transmitted, never logged.
-2. Derived AES-256 keys — memory only, non-extractable via WebCrypto.
-3. Stored credential plaintext — exists only transiently during an approved
+1. Vault master passwords — never persisted, transmitted, or logged.
+2. Random AES-256 vault keys — wrapped at rest; non-extractable in memory.
+3. Vault recovery keys — displayed once, user-held, and never persisted or transmitted.
+4. Vault synchronization authorization secrets — encrypted under the vault
+   key at rest; held only in memory after unlock; authorize writes but cannot decrypt.
+5. Stored credential plaintext — exists only transiently during an approved
    fill/copy/reveal operation.
-4. Vault metadata (app names, usernames, strength labels, timestamps) —
+6. Vault metadata (app names, usernames, strength labels, timestamps) —
    lower sensitivity, but still access-controlled.
 
 ---
@@ -45,12 +51,18 @@ Everything below follows from that one goal.
 ### T1 — Storage or backend compromise
 *Attacker reads every stored byte.*
 
-**Mitigated.** Each secret is sealed with AES-256-GCM under a key derived
-from that user's master password via PBKDF2-HMAC-SHA256 at 600,000
-iterations with a 128-bit random salt. Recovering one password means
-brute-forcing the master password at 600,000 hash operations per guess.
-A separate low-iteration verifier is stored for auth checks; it is not the
-encryption key and does not help decrypt anything.
+**Mitigated.** Each secret is sealed with AES-256-GCM under a random 256-bit
+vault data key. The vault master password is stretched locally with
+PBKDF2-HMAC-SHA256 at 600,000 iterations and wraps that random key; it does
+not encrypt item data directly. Credential ciphertext uses authenticated
+context containing the user and item IDs, so moving a valid blob to another
+record fails GCM authentication. The server never receives the vault master
+password, random vault key, or user-held recovery key.
+
+An attacker with only an account session also lacks the random vault-write
+authorization secret. Its keyed hash is stored by the backend and its plaintext
+is encrypted inside the vault profile. Profile changes, item writes, and deletes
+therefore require local vault unlock as well as account authentication.
 
 *Tested:* `packages/shared/test/crypto.test.js`,
 `test/vault-client.test.js` ("never persists plaintext anywhere in storage").
@@ -152,6 +164,26 @@ Suspend and screen-lock also trigger a lock.
 autocomplete fields, and payment/checkout hosts are excluded in the
 manifest.
 
+### T12 — Account takeover, TOTP phishing, or stolen browser session
+*Attacker passes account authentication and can request the user's stored data.*
+
+**Vault confidentiality and mutation authorization remain mitigated.** Account authentication and vault
+decryption are separate flows and use unrelated secrets. The account session
+authorizes encrypted-data access only; the client still requires the vault
+master password to unwrap its random vault key. Vault writes additionally need
+a random authorization secret decrypted only during vault unlock; the server
+stores only its keyed hash. Account passwords are hashed
+with Argon2id. TOTP seeds are AES-GCM-encrypted at rest, login challenges and
+MFA recovery codes are one-use, accepted TOTP steps cannot be replayed, and
+attempts are throttled.
+
+TOTP is not phishing-resistant: a real-time phishing proxy can relay a fresh
+code and steal a session. The independent vault unlock limits the consequence,
+but adding WebAuthn/passkeys remains recommended.
+
+*Tested:* `backend/tests/test_auth.py`, `backend/tests/test_vault.py`, and the
+wrapped-key/account-separation tests in `packages/shared/test/crypto.test.js`.
+
 ---
 
 ## Accepted risks (explicitly out of scope)
@@ -160,7 +192,9 @@ manifest.
 |---|---|
 | Compromised OS, browser binary, or malicious browser extension with equal privileges | Any zero-knowledge design assumes an honest client at unlock time. Mitigated only by a strict extension CSP and shipping no remote code. |
 | Malware with debugger access to process memory while unlocked | Defeats every password manager; out of scope for a user-level application. |
-| Forgotten master password | Unrecoverable **by design** — the trade-off of zero knowledge. Optional recovery codes are a planned addition, not a shipped feature. |
+| Loss of both vault master password and vault recovery key | Unrecoverable by design. The server cannot manufacture a replacement decryption key. |
+| Real-time TOTP phishing | TOTP is replay-resistant but not phishing-resistant. The vault still requires its separate password; WebAuthn/passkeys are the planned stronger account factor. |
+| Malicious JavaScript served by a compromised web origin | A hostile client can capture a vault password at entry. Signed extension/desktop distribution and deployment hardening reduce this risk; an honest client at unlock remains a zero-knowledge assumption. |
 | Metadata leakage (which apps a user has accounts for, credential strength labels) | Deliberately visible to admins so policy can be enforced centrally. Non-reversible; reveals no password content. |
 | Traffic analysis of the k-anonymity breach lookup | The 5-character SHA-1 prefix is shared by hundreds of passwords; the service cannot determine which was checked. |
 | UAC secure desktop, Windows sign-in, credential-provider screens, elevated processes | Never interacted with. Reported as unsupported rather than attempted. |
@@ -171,10 +205,11 @@ manifest.
 
 Stated plainly so future contributors don't do it by accident:
 
-1. Storing or transmitting the derived key or master password *in any form*.
+1. Storing or transmitting the vault key, vault recovery key, or vault master password *in any form*.
 2. Adding a server-side decrypt endpoint "for admin convenience".
 3. Relaxing origin matching to suffix/subdomain comparison.
 4. Matching desktop application identity on process name alone.
 5. Falling back to simulated keystrokes when `ValuePattern` is unavailable.
 6. Sending a password through the WhatsApp alert channel (metadata only).
 7. Logging any variable holding a decrypted credential.
+8. Letting a valid account session bypass the separate vault-unlock operation.

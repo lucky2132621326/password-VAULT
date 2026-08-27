@@ -6,6 +6,7 @@
 |---|---|---|
 | Node.js | ≥ 20 (tested on 24.13.1) | everything |
 | npm | ≥ 10 (tested on 11.8.0) | everything |
+| Python | ≥ 3.11 | FastAPI authentication service |
 | .NET SDK | 8.0 | Windows native helper only |
 | Chrome / Chromium | ≥ 116 | extension |
 | Windows | 10 or 11 | desktop assistant |
@@ -24,22 +25,47 @@ npm install          # installs all workspaces
 ## Run everything's tests
 
 ```bash
-npm test                 # all JS workspaces (147 tests)
-npm run test:shared      # 35
+npm test                 # all JS workspaces (161 tests)
+npm run test:backend     # 6 Python security tests
+npm run test:shared      # 41
 npm run test:extension   # 46
 npm run test:desktop     # 71
 ```
 
 ---
 
-## 1 · Web application
+## 1 · Account/encrypted-vault service + web application
+
+Install the Python dependencies and generate two independent development
+keys. These PowerShell environment variables last only for the current
+terminal; use a secret manager in production.
+
+```powershell
+python -m pip install -r backend/requirements-dev.txt
+$env:AEGIS_JWT_SECRET = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:AEGIS_MFA_ENCRYPTION_KEY = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:AEGIS_COOKIE_SECURE = "false"
+npm run dev:backend          # http://127.0.0.1:8000
+```
+
+In a second terminal:
 
 ```bash
 npm run build:web            # production build
-npm run dev -w frontend      # dev server on http://localhost:5173
+npm run dev:web              # dev server on http://localhost:5173
 ```
 
-Demo accounts: `alice / Demo@Vault2026` (user), `admin / Admin@Vault2026` (admin).
+Create an account in the web UI, scan the QR code with Google Authenticator,
+confirm the current six-digit code, save the eight one-time MFA recovery
+codes, and then choose a **different vault master password**. The account
+password reaches the authentication service over HTTPS; the vault master
+password does not.
+
+On first vault creation, AEGIS also displays an `AEGIS-…` vault recovery key.
+Store it offline. It is different from the eight MFA recovery codes:
+
+- MFA recovery codes replace Google Authenticator once and are verified by the server.
+- The vault recovery key decrypts and rewraps the random vault key locally and is never sent to the server.
 
 ---
 
@@ -68,7 +94,8 @@ extension.
 2. Enter any account name and master password. The **first** unlock for a
    given account name provisions that local profile with that password;
    subsequent unlocks verify against it.
-3. The popup now shows **Unlocked**, plus any saved credentials matching the
+3. Save the one-time-display local vault recovery key.
+4. The popup now shows **Unlocked**, plus any saved credentials matching the
    current tab's origin.
 
 ### Serve the demo fixtures
@@ -147,7 +174,8 @@ administrator rights required** to install or run.
 ## Repository layout
 
 ```
-frontend/                     existing AEGIS web app (unchanged)
+frontend/                     AEGIS web app + account/MFA/vault-unlock flow
+backend/                      FastAPI account password + TOTP authentication
 packages/shared/              canonical crypto, strength, schema, vault client
 apps/chrome-extension/
   ├── manifest.json           MV3 manifest

@@ -13,35 +13,37 @@ Most password-manager demos store passwords in a database and encrypt them with 
 
 One sentence for judges:
 
-> *The encryption key is derived from the user's master password inside their own browser and never leaves it, so the backend only ever stores unreadable ciphertext.*
+> *Account password plus Google Authenticator proves who the user is; a separate vault master password unwraps a random vault key locally, so taking over the account still does not decrypt the vault.*
 
 This is implemented for real using the browser's native WebCrypto API — not a progress bar, not a mock.
 
 ### How it works, step by step
 
-1. Alice types her master password into the login screen.
-2. Her browser runs it through **PBKDF2-HMAC-SHA256, 600,000 iterations**, with a 128-bit random salt. This is deliberately slow — it makes offline brute force ~600,000× more expensive per guess.
-3. That produces an **AES-256 key**, marked *non-extractable* in WebCrypto — even our own JavaScript cannot read the raw key bytes back out.
-4. Every saved password is encrypted individually with **AES-256-GCM** using a **fresh random 96-bit IV**, so identical passwords produce different ciphertext every time.
-5. What gets persisted is only `{ alg, iv, ct }` — random-looking bytes.
-6. On lock / idle timeout / app exit, the key reference is dropped. Nobody can turn that ciphertext back into plaintext without the master password.
+1. Alice authenticates her account with an **Argon2id-hashed account password** and a fresh six-digit **TOTP** from Google Authenticator.
+2. The server accepts each 30-second TOTP value once, throttles attempts, and issues a short-lived HttpOnly, SameSite=Strict session cookie.
+3. Account authentication authorizes access only to encrypted data. Alice must separately enter her **vault master password**, which never leaves the client.
+4. The client stretches that password with **PBKDF2-HMAC-SHA256 at 600,000 iterations** and uses the result only to unwrap a random 256-bit vault data key.
+5. Every password is encrypted with **AES-256-GCM**, a fresh random 96-bit IV, and authenticated context binding it to its user and item IDs.
+6. A separately wrapped, user-held vault recovery key can rotate the master-password wrapper without giving the server or an administrator decryption power.
+7. Vault mutations require a separate random authorization secret encrypted under the vault key, so an account-only attacker cannot replace or delete ciphertext.
+8. On lock / idle timeout / app exit, all in-memory key references are dropped.
 
-The master password itself is **never** transmitted. Only a separate, weaker *verifier* hash is stored, used solely to check "is this the right master password?"
+The account password is allowed to reach the authentication service over HTTPS. The **vault master password, vault recovery key, random vault key, and credential plaintext never do**.
 
 ---
 
 ## 2. What is built today
 
-### A. Web application (`frontend/`) — React 19 + Vite + Tailwind v4 · **complete**
+### A. Web application (`frontend/`) — React 19 + Vite + Tailwind v4
 
-**User role** (`alice / Demo@Vault2026`)
+**User role**
 - **Dashboard** — vault strength score, passwords stored, weak count, reused count, quick-access list with real brand logos, inline password generator, security recommendations, recent activity feed
 - **My Vault** — search/filter by category, reveal/copy/edit/delete, reuse warnings, compromise-lock state
 - **Generator** — random-string and Diceware-passphrase modes, live strength analysis, breach check
 - **Security Health** — breach/reuse/weak/stale scan, vault score, prioritised action queue, WhatsApp alert setup, demo breach trigger
 - **About** — architecture explainer + threat model
 
-**Admin role** (`admin / Admin@Vault2026`)
+**Admin role** (requires an administrator account provisioned outside public registration)
 - **Users** — provision/suspend, force rotation, inspect metadata (never plaintext)
 - **Vault Registry** — the zero-knowledge proof screen: real ciphertext for every credential, plus an "Attempt decrypt" button that genuinely fails with `OperationError` because AES-GCM's authentication tag can't be verified without the owner's key
 - **Policy** — org-wide password rules (min length, complexity, entropy floor, rotation interval, auto-lock, clipboard clear), enforced client-side *before* encryption
@@ -52,10 +54,13 @@ The master password itself is **never** transmitted. Only a separate, weaker *ve
 - Breach checking via HIBP's **k-anonymity** range API (only the first 5 chars of a SHA-1 hash leave the device), with an offline corpus fallback
 - Entropy-based strength scoring with explainable penalties (dictionary words, leetspeak, keyboard walks, sequences, repeats, years) and crack-time estimates
 - Self-clearing clipboard, idle auto-lock that drops the key from memory
+- Google Authenticator-compatible enrollment, TOTP login, single-use MFA recovery codes, and a separate vault-unlock screen
+- Random vault data key wrapped by the master password, plus a separately wrapped one-time-display vault recovery key
+- Authenticated credential context prevents valid ciphertext from being moved to a different user or item record
 - Item-level compromise lock: a breached credential locks (reveal/copy disabled) until rotated — the whole account is never deleted
 - Automatic WhatsApp breach alerts (metadata only — app name + severity, **never** the password)
 
-### B. Shared package (`packages/shared/`) — **complete, 35 tests passing**
+### B. Shared package (`packages/shared/`) — **complete, 41 tests passing**
 
 The canonical AEGIS crypto/strength/policy/schema modules, plus a `LocalVaultClient` interface used by both new clients. Kept byte-identical with the web app's versions so every client is cryptographically interoperable.
 
@@ -72,7 +77,7 @@ Also defines: strict origin normalisation & matching (phishing-resistant), deskt
 - Scoped, debounced MutationObserver (only new subtrees, never full-document rescans); Shadow-DOM aware; singleton panel prevents duplicates across framework re-renders
 - Every privileged message is schema-validated with sender/tab/origin checks
 
-### D. Windows desktop assistant (`apps/desktop/`) — **complete, 66 tests passing, Electron main process verified to launch**
+### D. Windows desktop assistant (`apps/desktop/`) — **complete, 71 tests passing, Electron main process verified to launch**
 
 - Electron + React UI with `nodeIntegration: false`, `contextIsolation: true`, `sandbox: true`, strict CSP, minimal preload bridge
 - .NET 8 native helper using **UI Automation focus-change events only** — no keyboard hooks, no keylogging, no screenshots, no OCR, no clipboard monitoring (enforced by an automated static test)
@@ -85,45 +90,48 @@ Also defines: strict origin normalisation & matching (phishing-resistant), deskt
 - Named-pipe IPC secured by a current-user-only ACL, schema-validated in both directions
 - Runs `asInvoker` — never requests administrator privileges
 
-### E. Test coverage — **147 automated tests, all passing**
+### E. Test coverage — **172 automated tests, all passing**
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `packages/shared` | 35 | KDF determinism, AES-GCM round-trip, fresh-IV uniqueness, wrong-key & tampered-ciphertext safety, CSPRNG-only generation, origin/phishing matching, app-identity matching, no-plaintext-persistence, audit trail |
+| `packages/shared` | 41 | KDF determinism, wrapped random vault keys, user-held recovery and rotation, ciphertext-context binding, legacy migration, AES-GCM safety, origin/phishing matching, no-plaintext-persistence, audit trail |
 | `apps/chrome-extension` | 46 | Form classification (login/signup/change/unknown/payment), dynamic & SPA forms, duplicate-panel prevention, origin matching, phishing rejection, HTTP rejection, locked vault, service-worker restart, malformed/unauthorised messages, no plaintext persistence |
-| `apps/desktop` | 66 | UIA classification, policy store, pause & per-app deny, clipboard auto-clear (incl. not clobbering user copies), IPC schema validation, identity mismatch refusal, locked vault, atomic storage writes, static no-keylogging/no-plaintext-logging guard |
+| `apps/desktop` | 71 | UIA classification, policy store, pause & per-app deny, clipboard auto-clear (incl. not clobbering user copies), IPC schema validation, identity mismatch refusal, locked vault, atomic storage writes, static no-keylogging/no-plaintext-logging guard |
+| `frontend` | 3 | authenticated vault API transport, ciphertext/revision preservation, conflict handling |
+| `backend` | 11 | Argon2id/TOTP authentication plus encrypted profile/item storage, ownership, vault-write proof, conflicts, and tombstones |
 
 ---
 
-## 3. What is NOT built yet — the backend
+## 3. Backend status and remaining client integration
 
-**This is the part being handed to the second team member.**
+The FastAPI **account authentication and encrypted vault service is built** under `backend/`. It owns account-password verification, encrypted TOTP seeds, one-time MFA challenges, recovery-code hashes, throttling, short-lived browser sessions, wrapped vault profiles, versioned ciphertext records, and deletion tombstones. It deliberately owns no vault-decryption material.
 
 Right now each client (web, extension, desktop) keeps its **own** encrypted local store:
 
 | Client | Storage |
 |---|---|
-| Web app | browser `localStorage` |
+| Web app | synchronized backend ciphertext plus a local encrypted cache |
 | Chrome extension | `chrome.storage.local` |
 | Desktop assistant | JSON files under Electron's `userData` |
 
-All three use the **identical encryption algorithm and identical item schema**, so records are already forward-compatible — but they don't yet *sync*.
+All three use the **identical encryption algorithm and identical item schema**. The web app now synchronizes with the backend. Extension and desktop remote adapters remain.
 
-**Why they can't sync today:** browsers isolate storage per origin by design, and a native desktop process cannot read a browser tab's JavaScript state at all. There is no way — short of breaking the browser's security model — for an extension or desktop app to read the web app's `localStorage`. The only correct bridge is a shared server.
+Browsers isolate storage per origin, and a native desktop process cannot read a browser tab's JavaScript state. The shared ciphertext API is the correct bridge; extension and desktop still need a short-lived device-session exchange before they can use it.
 
-**That server is the backend.** Once it exists, all three clients point at the same API, and a password saved in Chrome instantly appears in the desktop app and the web vault.
+The remaining integration phase is connecting the Chrome extension and desktop assistant to account MFA and the implemented ciphertext API. Their local-profile unlock screens are not yet protected by the account session.
 
 ### The backend's job in one line
 
 > Store ciphertext it cannot read, and serve it back to authenticated clients.
 
-It never sees a master password, never sees a plaintext password, never holds an encryption key. It is deliberately "dumb" about secrets — that dumbness *is* the security property.
+It never sees a **vault** master password, stored credential plaintext, vault recovery key, or vault encryption key. It is deliberately "dumb" about vault secrets — that dumbness *is* the security property.
 
-### Planned stack
+### Implemented authentication stack
 
 - **FastAPI** (Python) — fast to write, automatic Swagger docs at `/docs` (great for judges), easy JWT/session auth
 - **SQLite + SQLModel** — plenty for a hackathon; a single file, no server to provision
-- **Twilio** — the one place that talks to a third party, for WhatsApp breach alerts (metadata only)
+- **Argon2id + RFC 6238 TOTP** — account-password hashing and Google Authenticator-compatible MFA
+- **AES-256-GCM** — server-side encryption of TOTP seeds under an environment-provided key
 
 ---
 
@@ -135,16 +143,17 @@ It never sees a master password, never sees a plaintext password, never holds an
 │  (React)     │   │     (MV3)        │   │ (Electron + .NET) │
 └──────┬───────┘   └────────┬─────────┘   └─────────┬─────────┘
        │                    │                       │
-       │   master password → PBKDF2 → AES-256 key   │
-       │        (in-memory only, per client)        │
+       │ account password + TOTP → account session  │
+       │ vault password → PBKDF2 → unwrap random key│
+       │        (vault key in-memory only)          │
        │                    │                       │
        └────────────────────┼───────────────────────┘
                             │  only ciphertext + metadata
                             ▼
                  ┌─────────────────────┐
-                 │  FastAPI backend    │  ← TO BUILD
-                 │  SQLite (ciphertext)│
-                 │  Twilio (alerts)    │
+                 │ FastAPI vault API   │  ← BUILT
+                 │ Argon2id + TOTP     │
+                 │ encrypted-item sync│  ← WEB CONNECTED
                  └─────────────────────┘
 ```
 
@@ -152,8 +161,8 @@ It never sees a master password, never sees a plaintext password, never holds an
 
 ## 5. Demo script (~90 seconds)
 
-1. Login screen — point out the master-password explanation.
-2. Log in as **alice** → Dashboard: vault strength, stat tiles, brand logos.
+1. Create/sign in to an account, verify Google Authenticator, then point out the separate vault-unlock screen.
+2. Unlock the vault → Dashboard: vault strength, stat tiles, brand logos.
 3. **Security Health** — "it already found breached and reused passwords."
 4. **Demo: Simulate a Breach** → pick GitHub → *Trigger breach*. Watch it flip ELITE → CRITICAL, auto-lock, and fire a WhatsApp alert — live, offline, no wifi needed.
 5. **Generator** — generate one, show the live strength breakdown.
@@ -167,7 +176,7 @@ It never sees a master password, never sees a plaintext password, never holds an
 ## 6. Anticipated judge questions
 
 **"What if I forget my master password?"**
-The vault is unrecoverable by design — that's the zero-knowledge trade-off. Real products add optional recovery codes generated at signup; that's our next step.
+Use the separately generated `AEGIS-…` vault recovery key. Recovery immediately rotates both the master-password wrapper and the recovery key, invalidating the old values. Losing both the master password and this user-held key remains unrecoverable by design.
 
 **"Why PBKDF2 and not Argon2?"**
 Argon2 resists GPU/ASIC attacks better and is a good v2 upgrade. PBKDF2 is natively supported by every browser's WebCrypto with no extra library — critical for a demo that must just work. 600,000 iterations follows OWASP's current guidance.
@@ -176,7 +185,7 @@ Argon2 resists GPU/ASIC attacks better and is a good v2 upgrade. PBKDF2 is nativ
 No — and we demonstrate it live. Admin sees account existence, timestamps, categories, and non-reversible strength labels (computed client-side and uploaded without the password), which is enough to enforce policy without any privacy violation.
 
 **"What if the database is stolen?"**
-The attacker gets useless encrypted blobs. Decrypting one requires brute-forcing 600,000 PBKDF2 iterations per guess against that user's master password.
+The attacker gets encrypted blobs and a wrapped random vault key. Account credentials and TOTP sessions do not unwrap it; an offline attacker must still attack the independent vault master password or obtain the user-held vault recovery key.
 
 **"Is this actually secure or just a demo?"**
-The primitives (PBKDF2, AES-256-GCM, CSPRNG) are real, standard, and use genuine browser APIs — inspectable in DevTools. Simplified for the hackathon: no server-side login rate limiting yet, no master-password recovery flow, and the shared backend is still being built. The crypto boundary itself is not a mockup.
+The primitives and boundaries are implemented and tested: Argon2id for account passwords, RFC 6238 TOTP with one-use enforcement, PBKDF2 for the client-side wrapping key, AES-256-GCM for vault encryption, write authorization available only after vault unlock, optimistic synchronization, and a CSPRNG for every key/IV. Remaining work is shared production rate limiting, passkeys, and connecting extension/desktop to account MFA and the ciphertext API.

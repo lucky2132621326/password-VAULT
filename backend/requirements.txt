@@ -1,0 +1,7 @@
+argon2-cffi==25.1.0
+cryptography==45.0.7
+fastapi==0.116.1
+PyJWT==2.10.1
+pyotp==2.9.0
+sqlmodel==0.0.24
+uvicorn[standard]==0.35.0

@@ -3,8 +3,16 @@ dist/
 .env
 .env.local
 *.log
+*.db
+*.db-shm
+*.db-wal
 .DS_Store
 Thumbs.db
+
+# Python runtime/test output
+__pycache__/
+.pytest_cache/
+*.py[cod]
 
 # .NET build output (native-helper)
 bin/

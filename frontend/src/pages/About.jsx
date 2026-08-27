@@ -3,12 +3,13 @@ import { APP, CRYPTO } from '../lib/config'
 import { Card } from '../components/ui'
 
 const FLOW = [
-  { n: '01', t: 'Master password entered', d: 'Typed into the browser. Never sent over the network, never written to disk, never logged.' },
-  { n: '02', t: 'Key derivation', d: `${CRYPTO.kdf} with a 128-bit random salt and ${CRYPTO.iterations.toLocaleString()} iterations. The cost is deliberate: it makes offline guessing of the master password computationally expensive.` },
-  { n: '03', t: 'Non-extractable key', d: 'The resulting AES key is marked non-extractable in WebCrypto — even our own JavaScript cannot read the raw key bytes back out.' },
-  { n: '04', t: 'Authenticated encryption', d: `Each secret is sealed with ${CRYPTO.cipher} under a fresh 96-bit IV. GCM provides integrity as well as confidentiality: tampered ciphertext fails to decrypt rather than returning garbage.` },
-  { n: '05', t: 'Server stores ciphertext', d: 'The backend receives an opaque blob plus non-reversible strength metadata. A full database compromise yields no passwords.' },
-  { n: '06', t: 'Key dies on lock', d: 'Locking, idle timeout, or closing the tab drops the only reference to the key. Recovery requires the master password again.' },
+  { n: '01', t: 'Account authentication', d: 'An Argon2id-hashed account password plus a fresh Google Authenticator code proves account control. It grants no vault decryption key.' },
+  { n: '02', t: 'Separate vault master password', d: `The client applies ${CRYPTO.kdf} with a 128-bit random salt and ${CRYPTO.iterations.toLocaleString()} iterations. This password never reaches the authentication server.` },
+  { n: '03', t: 'Random vault key unwrapped', d: 'The derived key unwraps a random AES-256 vault data key, which is imported as non-extractable in WebCrypto.' },
+  { n: '04', t: 'Context-bound encryption', d: `Each secret is sealed with ${CRYPTO.cipher}, a fresh 96-bit IV, and authenticated user/item context. Tampering or moving ciphertext to another record fails.` },
+  { n: '05', t: 'Only encrypted data persists', d: 'Storage contains wrapped keys, ciphertext, salts, IVs, and metadata — never the vault master password, recovery key, or plaintext.' },
+  { n: '06', t: 'User-held recovery', d: 'A separately wrapped recovery key is shown once. Using it rotates both the master-password wrapper and the recovery key.' },
+  { n: '07', t: 'Key dies on lock', d: 'Locking, idle timeout, or closing the tab drops the only in-memory reference to the random vault key.' },
 ]
 
 const CONTROLS = [
@@ -76,8 +77,11 @@ export default function About() {
       <Card title="Threat model">
         <div className="space-y-2.5 text-[12.5px] leading-relaxed">
           <Threat ok label="Database dump / backend compromise">
-            Attacker obtains ciphertext, salts, and verifiers. Without each user's master password, recovering a
-            secret means brute-forcing {CRYPTO.iterations.toLocaleString()} PBKDF2 iterations per guess.
+            Attacker obtains ciphertext and a wrapped random vault key. Account credentials do not unwrap it;
+            the independent vault password still costs {CRYPTO.iterations.toLocaleString()} PBKDF2 iterations per guess.
+          </Threat>
+          <Threat ok label="Stolen account session">
+            The account can download encrypted data, but decryption and vault mutations remain locked until the separate master password unwraps the random key and write authorization locally.
           </Threat>
           <Threat ok label="Malicious or curious administrator">
             Full application and database access grants no plaintext. Every administrative action is logged.
@@ -98,8 +102,8 @@ export default function About() {
       <Card title="Stack">
         <div className="grid gap-3 sm:grid-cols-2">
           <Row icon={Layers} k="Frontend" v="React 19 · Vite · Tailwind v4 · Recharts" />
-          <Row icon={Cpu} k="Cryptography" v="WebCrypto — PBKDF2-HMAC-SHA256, AES-256-GCM" />
-          <Row icon={ShieldCheck} k="Backend" v="FastAPI · ciphertext-only persistence" />
+          <Row icon={Cpu} k="Cryptography" v="Argon2id account hash · PBKDF2 wrapping · AES-256-GCM vault" />
+          <Row icon={ShieldCheck} k="Backend" v="FastAPI · TOTP MFA · versioned ciphertext sync · write proof" />
           <Row icon={Fingerprint} k="Breach data" v="HIBP range API via k-anonymity, offline fallback" />
         </div>
       </Card>

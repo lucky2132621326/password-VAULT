@@ -22,7 +22,11 @@
 // under Electron's userData directory. See lib/storage-adapter.js in each
 // app for the concrete implementations.
 
-import { deriveKey, encryptField, decryptField, randomBytes, b64, checkBreached, generatePassword, generatePassphrase, sha256Hex } from './crypto.js'
+import {
+  deriveKey, createVaultProfile, unlockVaultProfile, recoverAndRewrapVaultProfile, credentialAad,
+  encryptField, decryptField, randomBytes, b64, checkBreached,
+  generatePassword, generatePassphrase, sha256Hex,
+} from './crypto.js'
 import { analyze, checkPolicy } from './strength.js'
 import { DEFAULT_POLICY } from './config.js'
 import { validateCredentialDraft, normalizeOrigin, originsMatch, appIdentityMatches, isSecureOrigin } from './credential-schema.js'
@@ -37,6 +41,7 @@ const KEYS = {
 
 const uid = () => b64(randomBytes(9)).replace(/[^a-zA-Z0-9]/g, '').slice(0, 10)
 const now = () => new Date().toISOString()
+const MIN_NEW_VAULT_PASSWORD_LENGTH = 14
 
 export class LocalVaultClient {
   /**
@@ -73,23 +78,85 @@ export class LocalVaultClient {
       // First unlock for this local profile: provision it. Mirrors the web
       // app's demo-account bootstrap, minus the fixed demo password list —
       // any master password provided here becomes that profile's password.
-      const { key, salt, verifier } = await deriveKey(masterPassword)
-      user = { id: uid(), username: uname, salt, verifier, createdAt: now() }
+      if (String(masterPassword).length < MIN_NEW_VAULT_PASSWORD_LENGTH) {
+        return { ok: false, error: `New vault master password must be at least ${MIN_NEW_VAULT_PASSWORD_LENGTH} characters` }
+      }
+      const { key, profile, recoveryKey } = await createVaultProfile(masterPassword)
+      user = { id: uid(), username: uname, vaultProfile: profile, createdAt: now() }
       users.push(user)
       await this._storage.set(KEYS.users, users)
       this._session = { userId: user.id, username: uname, key, unlockedAt: Date.now() }
       await this._audit('vault.unlocked', `Local profile provisioned and unlocked by ${this._clientName}`, 'info')
+      return { ok: true, recoveryKey, recoveryKeyIssued: true }
+    }
+
+    if (user.vaultProfile) {
+      const key = await unlockVaultProfile(masterPassword, user.vaultProfile)
+      if (!key) {
+        await this._audit(AUDIT_ACTIONS.UNLOCK_FAILED, `Wrong vault master password for "${uname}"`, 'warn')
+        return { ok: false, error: 'Invalid vault master password' }
+      }
+      let legacyKey = null
+      if (user.legacy?.salt && user.legacy?.verifier) {
+        const legacy = await deriveKey(masterPassword, user.legacy.salt)
+        if (legacy.verifier === user.legacy.verifier) legacyKey = legacy.key
+      }
+      this._session = { userId: user.id, username: uname, key, legacyKey, unlockedAt: Date.now() }
+      if (legacyKey) await this._completeLegacyMigration(user, users)
+      await this._audit('vault.unlocked', `Random vault key unwrapped by ${this._clientName}`, 'info')
       return { ok: true }
     }
 
-    const { key, verifier } = await deriveKey(masterPassword, user.salt)
-    if (verifier !== user.verifier) {
-      await this._audit(AUDIT_ACTIONS.UNLOCK_FAILED, `Wrong master password for "${uname}"`, 'warn')
-      return { ok: false, error: 'Invalid credentials' }
+    // Backward-compatible one-time migration from version 1, where the
+    // password-derived key encrypted items directly.
+    const legacy = await deriveKey(masterPassword, user.salt)
+    if (legacy.verifier !== user.verifier) {
+      await this._audit(AUDIT_ACTIONS.UNLOCK_FAILED, `Wrong vault master password for "${uname}"`, 'warn')
+      return { ok: false, error: 'Invalid vault master password' }
     }
-    this._session = { userId: user.id, username: uname, key, unlockedAt: Date.now() }
-    await this._audit('vault.unlocked', `Key derived by ${this._clientName}`, 'info')
-    return { ok: true }
+    const created = await createVaultProfile(masterPassword)
+    user.vaultProfile = created.profile
+    user.legacy = { salt: user.salt, verifier: user.verifier }
+    await this._storage.set(KEYS.users, users)
+    this._session = { userId: user.id, username: uname, key: created.key, legacyKey: legacy.key, unlockedAt: Date.now() }
+    await this._completeLegacyMigration(user, users)
+    await this._audit('vault.migrated', `Legacy profile migrated to a wrapped random vault key by ${this._clientName}`, 'info')
+    return { ok: true, recoveryKey: created.recoveryKey, recoveryKeyIssued: true, migrated: true }
+  }
+
+  async recover(username, recoveryKey, newMasterPassword) {
+    const uname = String(username).trim().toLowerCase()
+    const users = (await this._storage.get(KEYS.users)) ?? []
+    const user = users.find((entry) => entry.username === uname)
+    if (!user?.vaultProfile) return { ok: false, error: 'Recovery unavailable' }
+    if (String(newMasterPassword).length < MIN_NEW_VAULT_PASSWORD_LENGTH) {
+      return { ok: false, error: `New vault master password must be at least ${MIN_NEW_VAULT_PASSWORD_LENGTH} characters` }
+    }
+    const recovered = await recoverAndRewrapVaultProfile(recoveryKey, newMasterPassword, user.vaultProfile)
+    if (!recovered) {
+      await this._audit(AUDIT_ACTIONS.UNLOCK_FAILED, `Invalid vault recovery key for "${uname}"`, 'warn')
+      return { ok: false, error: 'Invalid vault recovery key' }
+    }
+    user.vaultProfile = recovered.profile
+    await this._storage.set(KEYS.users, users)
+    this._session = { userId: user.id, username: uname, key: recovered.key, unlockedAt: Date.now(), recovered: true }
+    await this._audit('vault.recovered', `Vault recovered and rewrapped by ${this._clientName}`, 'warn')
+    return { ok: true, recoveryKey: recovered.recoveryKey, recoveryKeyIssued: true }
+  }
+
+  async _completeLegacyMigration(user, users) {
+    const items = (await this._storage.get(KEYS.items)) ?? []
+    for (const item of items.filter((entry) => entry.userId === user.id && (entry.password?.v ?? 1) < 2)) {
+      const plaintext = await decryptField(this._session.legacyKey, item.password)
+      if (plaintext == null) throw new Error('Legacy vault migration failed authentication')
+      item.password = await encryptField(this._session.key, plaintext, credentialAad(user.id, item.id))
+    }
+    await this._storage.set(KEYS.items, items)
+    delete user.salt
+    delete user.verifier
+    delete user.legacy
+    this._session.legacyKey = null
+    await this._storage.set(KEYS.users, users)
   }
 
   async lock(reason = 'manual') {
@@ -161,10 +228,11 @@ export class LocalVaultClient {
     const { ok, errors } = validateCredentialDraft(draft)
     if (!ok) return { ok: false, errors }
 
-    const blob = await encryptField(this._session.key, draft.password)
+    const itemId = uid()
+    const blob = await encryptField(this._session.key, draft.password, credentialAad(this._session.userId, itemId))
     const a = analyze(draft.password)
     const item = {
-      id: uid(), userId: this._session.userId,
+      id: itemId, userId: this._session.userId,
       app: draft.app, username: draft.username, url: draft.url ?? null, category: draft.category ?? 'Other',
       password: blob, strength: a.level, entropy: a.entropy,
       createdAt: now(), updatedAt: now(), favorite: false,
@@ -187,7 +255,7 @@ export class LocalVaultClient {
     if (!item) return { ok: false, error: 'Not found' }
 
     if (draft.password) {
-      const blob = await encryptField(this._session.key, draft.password)
+      const blob = await encryptField(this._session.key, draft.password, credentialAad(item.userId, item.id))
       const a = analyze(draft.password)
       Object.assign(item, {
         password: blob, strength: a.level, entropy: a.entropy,
@@ -219,7 +287,9 @@ export class LocalVaultClient {
       await this._audit(AUDIT_ACTIONS.AUTOFILL_BLOCKED, `${item.app} is locked pending rotation`, 'warn')
       return null
     }
-    const pt = await decryptField(this._session.key, item.password)
+    const decryptionKey = (item.password?.v ?? 1) >= 2 ? this._session.key : this._session.legacyKey
+    if (!decryptionKey) return null
+    const pt = await decryptField(decryptionKey, item.password, credentialAad(item.userId, item.id))
     await this._audit(AUDIT_ACTIONS.AUTOFILL_FILLED, `${item.app} revealed via ${this._clientName} (${reasonForAudit})`, 'warn')
     return pt
   }

@@ -16,6 +16,7 @@ export default function ItemModal({ item, initialPassword = '', existingPassword
   const [breached, setBreached] = useState(null)
   const [checking, setChecking] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
 
   const policy = getPolicy()
   const reusedFor = existingPasswords.find(
@@ -41,8 +42,10 @@ export default function ItemModal({ item, initialPassword = '', existingPassword
   async function save() {
     if (!form.app || !form.password || saving) return
     setSaving(true)
-    await saveItem(form)
+    setSaveError('')
+    const result = await saveItem(form)
     setSaving(false)
+    if (!result.ok) { setSaveError(result.error); return }
     onSaved?.()
     onClose()
   }
@@ -141,6 +144,7 @@ export default function ItemModal({ item, initialPassword = '', existingPassword
                 Cancel
               </button>
             </div>
+            {saveError && <p className="text-[11.5px] text-rose-300">{saveError}</p>}
           </div>
 
           <div>

@@ -10,7 +10,8 @@ been verified; rehearse it before committing to it on stage.
 
 ```bash
 npm install
-npm test                      # expect 147 passing
+npm test                      # expect 161 JavaScript tests passing
+npm run test:backend          # expect 6 authentication tests passing
 npm run build:extension
 npx serve apps/chrome-extension/test/fixtures -l 8080   # leave running
 ```
@@ -21,7 +22,7 @@ Load `apps/chrome-extension/dist` via `chrome://extensions` → Developer mode
 Have three tabs ready:
 1. <http://localhost:8080/demo.html> — fixtures
 2. `chrome://extensions` — to show the reload/inspect surface
-3. The web app (`npm run dev -w frontend`) — for the zero-knowledge reveal
+3. The web app + FastAPI auth service (see `docs/INSTALL.md`)
 
 ---
 
@@ -159,20 +160,21 @@ Password**.
 
 ---
 
-## Demo C · The zero-knowledge proof (~45 s) — strongest closer
+## Demo C · Account takeover does not unlock the vault (~90 s) — strongest closer
 
-Switch to the **web app**. Log in as `admin / Admin@Vault2026` → **Vault
-Registry**.
+Switch to the web app. Create/sign in to an account with the account password,
+then enter the current Google Authenticator code.
 
-> "This is the complete server-side record — exactly what an admin, a
-> database dump, or an attacker who owns the backend would get."
+> "The account is authenticated, but the vault is still locked. A stolen
+> session reaches the same boundary: it can authorize encrypted data, not
+> decrypt it."
 
-Point at real `iv` and `ct` base64 values. Click **Attempt decrypt**.
+Enter the separate vault master password. On first creation, point at the
+one-time `AEGIS-…` recovery key and store it outside the application.
 
-> "`OperationError` — the AES-GCM authentication tag can't be verified. That
-> isn't a scripted message; it's the browser's real crypto engine refusing.
-> The key is derived from Alice's master password inside *her* browser. No
-> admin role, no database credential, no server-side key recovers this."
+> "The master password unwraps a random AES-256 vault key locally. The account
+> server never receives the master password, recovery key, or vault key. Every
+> credential is also cryptographically bound to its user and item IDs."
 
 Close with:
 
@@ -194,10 +196,12 @@ Close with:
 
 ## Things to say honestly if asked
 
-- The three clients **do not yet share one vault** — the backend that
-  enables that is in progress. Each client's store uses the identical
-  algorithm and schema, so they sync the moment it lands.
+- The FastAPI **account-auth and encrypted-item backend is built**, and the web
+  client synchronizes versioned ciphertext through it. Extension/desktop
+  account-MFA and remote adapters are still in progress, so do not claim full
+  three-client sync yet.
 - The .NET helper's live UI Automation behaviour is **unverified**; the
   logic is unit-tested in both JS and C#.
-- PBKDF2 rather than Argon2, deliberately — native WebCrypto support, no
-  WASM dependency. Argon2 is the v2 upgrade.
+- Account passwords use Argon2id. The client-side vault wrapping key uses
+  PBKDF2 deliberately for native WebCrypto support; Argon2id remains the
+  preferred future vault-KDF upgrade.

@@ -57,7 +57,7 @@ export default function AdminRegistry() {
           <strong className="text-indigo-300">Zero-knowledge boundary.</strong> This is the complete server-side
           record for every credential in the system — exactly what an administrator, a database dump, or an
           attacker who compromises the backend would obtain. Each secret is sealed with {CRYPTO.cipher} under a
-          key derived from the owner's master password, which the server never receives. Administrators can
+          random vault key wrapped by the owner's master password, which the server never receives. Administrators can
           manage lifecycle and enforce policy; they cannot read a single password.
         </div>
       </div>
@@ -174,7 +174,7 @@ export default function AdminRegistry() {
                     <div>
                       <strong>DECRYPTION FAILED — OperationError</strong>
                       <div className="mt-0.5 text-rose-300/80">
-                        AES-GCM authentication tag could not be verified. The decryption key is derived from{' '}
+                        AES-GCM authentication tag could not be verified. The random decryption key is wrapped by{' '}
                         {r.owner}'s master password, which exists only in that user's browser. No administrative
                         role, database credential, or server-side key can recover this value.
                       </div>

@@ -2,7 +2,8 @@
 //
 // Threat model: the server is UNTRUSTED. It stores ciphertext it cannot read.
 // The master password never leaves this file's scope and is never transmitted.
-// The derived key lives only in memory and dies on lock / refresh.
+// The password-derived wrapping key and random vault key live only in memory
+// and die on lock / refresh.
 //
 // PROVENANCE: this is the canonical AEGIS crypto module, kept byte-identical
 // with frontend/src/lib/crypto.js. It is duplicated here — not re-exported —
@@ -22,6 +23,9 @@ const dec = new TextDecoder()
 // ─── base64 <-> bytes ─────────────────────────────────────────────────────
 export const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
 export const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0))
+
+export const b64url = (buf) => b64(buf).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+export const unb64url = (s) => unb64(String(s).replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - String(s).length % 4) % 4))
 
 export const randomBytes = (n) => crypto.getRandomValues(new Uint8Array(n))
 
@@ -44,8 +48,8 @@ export async function deriveKey(masterPassword, saltB64) {
     ['encrypt', 'decrypt'],
   )
 
-  // Separate, non-reversible verifier so we can check "is this the right master
-  // password?" without ever storing the password or the encryption key itself.
+  // Legacy v1 verifier. New v2 vault profiles verify the password by
+  // authenticated unwrapping and never persist this value.
   const verifierBits = await crypto.subtle.deriveBits(
     { name: 'PBKDF2', salt, iterations: 10_000, hash: 'SHA-256' },
     baseKey,
@@ -55,20 +59,161 @@ export async function deriveKey(masterPassword, saltB64) {
   return { key, salt: b64(salt), verifier: b64(verifierBits) }
 }
 
+async function importAesKey(raw) {
+  return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
+}
+
+// Version 2 profiles separate the password-derived wrapping key from the
+// random vault data key. Account authentication never receives either one.
+const VAULT_KEY_AAD = 'aegis:vault-key:v2'
+const RECOVERY_KEY_AAD = 'aegis:vault-recovery:v2'
+const VAULT_SYNC_AAD = 'aegis:vault-sync:v2'
+
+export const credentialAad = (userId, itemId) => `aegis:credential:v2:${userId}:${itemId}`
+
+export async function createVaultProfile(masterPassword) {
+  const vaultKeyBytes = randomBytes(32)
+  const vaultKey = await importAesKey(vaultKeyBytes)
+  const { key: wrappingKey, salt } = await deriveKey(masterPassword)
+  const wrappedVaultKey = await encryptField(wrappingKey, b64(vaultKeyBytes), VAULT_KEY_AAD)
+
+  const recoveryBytes = randomBytes(32)
+  const recoveryKey = `AEGIS-${b64url(recoveryBytes)}`
+  const recoveryCryptoKey = await importAesKey(recoveryBytes)
+  const recoveryWrappedVaultKey = await encryptField(recoveryCryptoKey, b64(vaultKeyBytes), RECOVERY_KEY_AAD)
+
+  const syncBytes = randomBytes(32)
+  const syncSecret = `AEGIS-SYNC-${b64url(syncBytes)}`
+  const wrappedSyncSecret = await encryptField(vaultKey, syncSecret, VAULT_SYNC_AAD)
+
+  vaultKeyBytes.fill(0)
+  recoveryBytes.fill(0)
+  syncBytes.fill(0)
+  return {
+    key: vaultKey,
+    recoveryKey,
+    syncSecret,
+    profile: {
+      version: 2,
+      kdf: { name: CRYPTO.kdf, iterations: CRYPTO.iterations, hash: 'SHA-256' },
+      salt,
+      wrappedVaultKey,
+      recoveryWrappedVaultKey,
+      wrappedSyncSecret,
+    },
+  }
+}
+
+export async function unlockVaultSyncSecret(vaultKey, profile) {
+  if (!vaultKey || !profile?.wrappedSyncSecret) return null
+  const value = await decryptField(vaultKey, profile.wrappedSyncSecret, VAULT_SYNC_AAD)
+  return value?.startsWith('AEGIS-SYNC-') ? value : null
+}
+
+export async function provisionVaultSyncSecret(vaultKey, profile) {
+  if (!vaultKey || !profile) return null
+  const syncBytes = randomBytes(32)
+  const syncSecret = `AEGIS-SYNC-${b64url(syncBytes)}`
+  syncBytes.fill(0)
+  const wrappedSyncSecret = await encryptField(vaultKey, syncSecret, VAULT_SYNC_AAD)
+  return { syncSecret, profile: { ...profile, wrappedSyncSecret } }
+}
+
+export async function unlockVaultProfile(masterPassword, profile) {
+  if (!profile || profile.version !== 2 || !profile.salt || !profile.wrappedVaultKey) return null
+  const { key: wrappingKey } = await deriveKey(masterPassword, profile.salt)
+  const encoded = await decryptField(wrappingKey, profile.wrappedVaultKey, VAULT_KEY_AAD)
+  if (!encoded) return null
+  const raw = unb64(encoded)
+  try { return await importAesKey(raw) } finally { raw.fill(0) }
+}
+
+export async function recoverVaultProfile(recoveryKey, profile) {
+  const encodedKey = String(recoveryKey ?? '').trim()
+  if (!encodedKey.startsWith('AEGIS-')) return null
+  try {
+    const recoveryBytes = unb64url(encodedKey.slice(6))
+    if (recoveryBytes.length !== 32) return null
+    const key = await importAesKey(recoveryBytes)
+    recoveryBytes.fill(0)
+    const encoded = await decryptField(key, profile.recoveryWrappedVaultKey, RECOVERY_KEY_AAD)
+    if (!encoded) return null
+    const raw = unb64(encoded)
+    try { return await importAesKey(raw) } finally { raw.fill(0) }
+  } catch {
+    return null
+  }
+}
+
+export async function recoverAndRewrapVaultProfile(recoveryKey, newMasterPassword, profile) {
+  const encodedKey = String(recoveryKey ?? '').trim()
+  if (!encodedKey.startsWith('AEGIS-') || !newMasterPassword) return null
+  try {
+    const oldRecoveryBytes = unb64url(encodedKey.slice(6))
+    if (oldRecoveryBytes.length !== 32) return null
+    const oldRecoveryKey = await importAesKey(oldRecoveryBytes)
+    oldRecoveryBytes.fill(0)
+    const encodedVaultKey = await decryptField(oldRecoveryKey, profile.recoveryWrappedVaultKey, RECOVERY_KEY_AAD)
+    if (!encodedVaultKey) return null
+
+    const vaultKeyBytes = unb64(encodedVaultKey)
+    const vaultKey = await importAesKey(vaultKeyBytes)
+    let syncSecret = await unlockVaultSyncSecret(vaultKey, profile)
+    let wrappedSyncSecret = profile.wrappedSyncSecret
+    if (!syncSecret) {
+      const provisioned = await provisionVaultSyncSecret(vaultKey, profile)
+      syncSecret = provisioned.syncSecret
+      wrappedSyncSecret = provisioned.profile.wrappedSyncSecret
+    }
+    const { key: wrappingKey, salt } = await deriveKey(newMasterPassword)
+    const wrappedVaultKey = await encryptField(wrappingKey, b64(vaultKeyBytes), VAULT_KEY_AAD)
+
+    const newRecoveryBytes = randomBytes(32)
+    const newRecoveryKey = `AEGIS-${b64url(newRecoveryBytes)}`
+    const recoveryCryptoKey = await importAesKey(newRecoveryBytes)
+    const recoveryWrappedVaultKey = await encryptField(recoveryCryptoKey, b64(vaultKeyBytes), RECOVERY_KEY_AAD)
+    vaultKeyBytes.fill(0)
+    newRecoveryBytes.fill(0)
+
+    return {
+      key: vaultKey,
+      recoveryKey: newRecoveryKey,
+      syncSecret,
+      profile: {
+        version: 2,
+        kdf: { name: CRYPTO.kdf, iterations: CRYPTO.iterations, hash: 'SHA-256' },
+        salt,
+        wrappedVaultKey,
+        recoveryWrappedVaultKey,
+        wrappedSyncSecret,
+      },
+    }
+  } catch {
+    return null
+  }
+}
+
 // ─── Authenticated encryption ─────────────────────────────────────────────
 // AES-GCM gives confidentiality AND integrity: a tampered blob fails to decrypt
 // rather than silently returning garbage. Fresh random IV on every write.
 
-export async function encryptField(key, plaintext) {
+export async function encryptField(key, plaintext, additionalData = '') {
   const iv = randomBytes(CRYPTO.ivBits / 8)
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(plaintext))
-  return { iv: b64(iv), ct: b64(ct), alg: CRYPTO.cipher }
+  const algorithm = { name: 'AES-GCM', iv }
+  if (additionalData) algorithm.additionalData = enc.encode(additionalData)
+  const ct = await crypto.subtle.encrypt(algorithm, key, enc.encode(plaintext))
+  return { v: additionalData ? 2 : 1, iv: b64(iv), ct: b64(ct), alg: CRYPTO.cipher }
 }
 
-export async function decryptField(key, blob) {
+export async function decryptField(key, blob, additionalData = '') {
   try {
+    const algorithm = { name: 'AES-GCM', iv: unb64(blob.iv) }
+    if (blob.v >= 2) {
+      if (!additionalData) return null
+      algorithm.additionalData = enc.encode(additionalData)
+    }
     const pt = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: unb64(blob.iv) }, key, unb64(blob.ct),
+      algorithm, key, unb64(blob.ct),
     )
     return dec.decode(pt)
   } catch {

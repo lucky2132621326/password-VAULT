@@ -9,8 +9,9 @@ this document says so — do not claim otherwise in a demo.
 
 | Component | Build | Automated tests | Run/manual verification |
 |---|---|---|---|
-| Web app (`frontend/`) | ✅ builds | — (pre-existing, unchanged) | ✅ exercised in browser |
-| `packages/shared` | n/a (source) | ✅ 35 passing | ✅ via dependents |
+| Web app (`frontend/`) | ✅ builds | ✅ 3 sync transport tests | ✅ exercised in browser |
+| Account + encrypted vault API (`backend/`) | n/a | ✅ 11 passing | ✅ live TOTP + ciphertext CRUD flow verified |
+| `packages/shared` | n/a (source) | ✅ 41 passing | ✅ via dependents |
 | Chrome extension | ✅ builds to loadable MV3 unpacked | ✅ 46 passing | ⚠️ **not loaded into a real Chrome profile** |
 | Desktop — Electron side | ✅ renderer builds; main process launches | ✅ 71 passing | ⚠️ partial (see below) |
 | Desktop — .NET UIA helper | ❌ **never compiled** | ❌ **never run** | ❌ |
@@ -47,29 +48,40 @@ live UIA behaviour is not.
 
 ---
 
-## Architectural limitation: the three clients do not yet share one vault
+## Architectural limitation: extension/desktop remote integration
+
+The FastAPI service and web flow now implement: account password →
+TOTP/recovery code → short-lived HttpOnly session → separate local vault unlock
+→ versioned ciphertext synchronization. Vault writes require an additional
+random authorization secret that is encrypted under the vault key and exists
+in plaintext only while unlocked.
+
+The Chrome extension and desktop assistant still use local-only profiles and
+are **not yet connected to the account MFA session or remote API**. Do not
+claim that MFA protects their local profile unlock screens in this phase.
+
+All three clients do not yet share one vault; the web backend path is complete,
+while extension and desktop adapters remain.
 
 Today each client keeps its own encrypted store:
 
 | Client | Storage |
 |---|---|
-| Web app | browser `localStorage` |
+| Web app | backend ciphertext/tombstones plus a local encrypted cache |
 | Chrome extension | `chrome.storage.local` |
 | Desktop assistant | JSON files under Electron `userData` |
 
-**Why, and why this is not a design flaw:** browsers isolate storage per
-origin by design, and a native process cannot read a browser tab's
-JavaScript state at all. There is no mechanism — short of breaking the
-browser's security model — for an extension or desktop app to read the web
-app's `localStorage`. The only correct bridge is a shared server, which is
-the backend currently being built (see `docs/BACKEND_PROMPT.md`).
+Browsers isolate storage per origin, and a native process cannot read a browser
+tab's JavaScript state. The implemented shared encrypted-item service is the
+bridge. Extension and desktop still require a safe device/session-token
+exchange and remote storage adapter.
 
 All three use the **identical algorithm and identical item schema**
-(`packages/shared/src/credential-schema.js`), so every record already stored
-is forward-compatible: when the backend lands, they sync without migration.
+(`packages/shared/src/credential-schema.js`), so their encrypted records remain
+format-compatible with the implemented API.
 
-**Do not claim cross-client sync in the demo.** Demo each client's own
-vault, and describe sync as the next milestone.
+**Claim web synchronization only.** Do not claim extension↔desktop↔web sync
+until those two clients have remote authentication adapters.
 
 ---
 
@@ -122,24 +134,32 @@ vault, and describe sync as the next milestone.
 
 ## Shared/crypto limitations
 
-- **PBKDF2, not Argon2.** Argon2 resists GPU/ASIC attacks better and is the
-  right v2 upgrade. PBKDF2 was chosen because it is natively available in
+- **Vault wrapping uses PBKDF2, not Argon2.** Account passwords are hashed
+  server-side with Argon2id. The client-side vault wrapping key still uses
+  PBKDF2 because it is natively available in
   every browser's WebCrypto with no additional library — important for a
   build that must work everywhere without bundling a WASM dependency.
   600,000 iterations follows current OWASP guidance for PBKDF2-HMAC-SHA256.
 - **Key derivation takes ~0.5–2 s** on typical hardware. That cost is the
   security property, but it is user-visible on unlock.
-- **No master-password recovery.** Forgotten means unrecoverable. Recovery
-  codes are a planned addition.
+- **Vault recovery is only as durable as the user's copy.** A 256-bit
+  `AEGIS-…` recovery key is generated and displayed once. It is not stored by
+  AEGIS. Recovery rotates the master-password wrapper and generates a new
+  recovery key. Losing both the master password and recovery key is
+  intentionally unrecoverable.
 - **Breach checking needs network** for the live HIBP range API. Offline, it
   falls back to a small local corpus of the most common breached passwords,
   which is far less comprehensive — the demo breach simulator uses that
   corpus deliberately so it works without venue wifi.
 - **Reuse detection is per-client**, because it requires decrypting that
   client's own items. It will become global once the backend ships.
-- **No rate limiting on unlock attempts.** Local brute-force protection
-  currently rests entirely on the PBKDF2 cost. Server-side rate limiting is
-  specified for the backend.
+- **Local vault unlock cannot be centrally rate-limited.** Offline protection
+  rests on the PBKDF2 cost. Account-password, TOTP, and MFA-recovery attempts
+  are throttled by the backend, but its current limiter is process-local and
+  must be replaced by Redis or equivalent before a multi-worker deployment.
+- **TOTP is not phishing-resistant.** A real-time phishing proxy can relay a
+  valid code. Account compromise still does not unwrap the independent vault,
+  but WebAuthn/passkeys are the recommended next authentication upgrade.
 
 ---
 

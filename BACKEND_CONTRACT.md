@@ -1,185 +1,72 @@
-# AEGIS — Backend contract (FastAPI)
+# AEGIS backend contract (implemented)
 
-Frontend is fully working right now against an in-browser mock store
-(`src/lib/vault.js` + `localStorage`). It does **not** need you to be running.
-Wire the real API in whenever you're ready — swap `src/lib/vault.js`'s
-persistence for `fetch` calls to these endpoints, same shapes.
+The FastAPI service under `backend/` implements account MFA and zero-knowledge
+vault storage. The web client is connected through `frontend/src/lib/vault-api.js`.
 
-## The one rule
+## Non-negotiable boundary
 
-**The server never receives a plaintext password and never receives the master
-password.** Every `password` field that crosses the wire is already a JSON
-blob: `{ "alg": "AES-256-GCM", "iv": "<base64>", "ct": "<base64>" }`. Your job
-is to store and return that blob byte-for-byte. Don't parse it, don't touch it.
+The server never receives a vault master password, vault recovery key, vault
+data key, or stored password plaintext. Stored passwords cross the API only as
+validated AES-256-GCM blobs:
 
-## Suggested endpoints
-
-```
-POST /api/auth/register     { username, salt, verifier, name, role }
-POST /api/auth/verify       { username, verifier } -> { ok, user }
-     # you compare `verifier` to what you stored at registration.
-     # if you want real login sessions, issue a JWT/session cookie here.
-
-GET  /api/users                                    (admin only)
-POST /api/users/:id/status  { status: "active"|"suspended" }
-POST /api/users/:id/rotate
-
-GET  /api/items                                    (current user's items)
-POST /api/items             { app, username, url, category,
-                               password: {alg, iv, ct},
-                               strength, entropy }
-PUT  /api/items/:id         (same body)
-DELETE /api/items/:id
-
-GET  /api/admin/items                              (admin — metadata only,
-                                                      same ciphertext blobs)
-
-GET  /api/policy
-PUT  /api/policy            (admin only)
-
-GET  /api/audit             (admin only, paginated)
-POST /api/audit             { action, detail, severity }
-
-POST /api/alerts/whatsapp   { to, template, variables }
-     # see "Breach alerts (WhatsApp)" below — this is the ONLY endpoint that
-     # talks to a third party (Twilio), so it's the one place secrets live.
+```json
+{ "v": 2, "alg": "AES-256-GCM", "iv": "<96-bit base64 IV>", "ct": "<base64 ciphertext+tag>" }
 ```
 
-## Breach alerts (WhatsApp)
+Application name, username, URL, category, strength, and timestamps are
+access-controlled metadata, not encrypted in the current schema. See
+`docs/THREAT_MODEL.md` for the accepted metadata-leakage tradeoff.
 
-When a stored credential is flagged as compromised (breached in a public
-dump, reused, or an admin flags it manually), the frontend locks that one
-item and asks you to send a WhatsApp notification. **The request body never
-contains a password** — only `{ to, template, variables }` where `variables`
-is app name / reason / timestamp. Keep it that way: if you ever see a
-`password` field on this route, something upstream broke the zero-knowledge
-guarantee and the frontend has a bug.
+## Authentication
 
-```
-POST /api/alerts/whatsapp
-{ "to": "+919966007804", "template": "breach_alert",
-  "variables": { "app": "Instagram", "reason": "found in a public breach (471 exposures)", "when": "8/27/2026, 3:04:12 PM" } }
-
--> 200 { "ok": true, "sid": "SM..." }
--> 502 { "ok": false, "error": "..." }   # frontend degrades gracefully either way
+```text
+POST /api/auth/register
+POST /api/auth/enroll/confirm
+POST /api/auth/login
+POST /api/auth/totp
+POST /api/auth/recovery
+GET  /api/auth/me
+POST /api/auth/logout
 ```
 
-Server-side implementation (Twilio's Node SDK, called from FastAPI via a
-small subprocess/queue, or reimplemented with `twilio` the Python package —
-either is fine):
+Account passwords are Argon2id-hashed. Google Authenticator-compatible TOTP
+seeds are AES-GCM-encrypted under a server environment key. Challenges,
+authenticator steps, and recovery codes are single-use. Successful MFA creates
+a short-lived HttpOnly, SameSite=Strict cookie.
 
-```python
-# main.py — Twilio credentials NEVER go in frontend code, a repo, or a commit.
-# Set these as real environment variables (.env, excluded via .gitignore,
-# or your host's secret manager) and load them at runtime only.
-import os
-from twilio.rest import Client
+## Vault synchronization
 
-client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-
-@app.post("/api/alerts/whatsapp")
-def send_alert(body: AlertRequest, user=Depends(require_auth)):
-    message = client.messages.create(
-        from_="whatsapp:+14155238886",           # Twilio sandbox/business number
-        content_sid="HXb5b62575e6e4ff6129ad7c8efe1f983e",  # pre-approved template
-        content_variables=json.dumps(body.variables),
-        to=f"whatsapp:{body.to}",
-    )
-    return {"ok": True, "sid": message.sid}
+```text
+GET    /api/vault
+PUT    /api/vault/profile
+PUT    /api/vault/items/{item_id}
+DELETE /api/vault/items/{item_id}?expectedRevision=N
 ```
 
-A few things worth being deliberate about:
+`GET /api/vault` requires the MFA session and returns the current user's wrapped
+profile, live encrypted records, and deletion tombstones.
 
-- **Rotate the Account SID / Auth Token before this ships anywhere** if they were
-  ever pasted into a chat, a doc, or a commit — treat any credential that's been
-  shared in plaintext as burned, regenerate it in the Twilio console.
-- **`.env` goes in `.gitignore`.** Never commit it. If a `.env.example` is useful
-  for teammates, commit that instead, with placeholder values.
-- Content templates (the `content_sid`) must be pre-approved in the Twilio
-  console before they can be sent outside the 24-hour session window — that's
-  why the frontend sends a `template` name + `variables`, not free text; map
-  `template: "breach_alert"` to your approved Content SID server-side.
-- Rate-limit this endpoint per user (e.g. 1 alert / minute) — it's the one
-  route that can spend real money and spam a real phone number.
+Every mutation also requires:
 
-## Minimal data model
-
-```python
-class User(BaseModel):
-    id: str
-    username: str
-    name: str
-    role: Literal["user", "admin"]
-    salt: str          # base64, from client's PBKDF2 call
-    verifier: str       # base64, NOT the encryption key — just an auth check
-    status: Literal["active", "suspended"] = "active"
-    mfa: bool = False
-    rotation_required: bool = False
-    phone: str | None = None   # E.164, WhatsApp alert target — never anything sensitive
-    created_at: datetime
-    last_seen: datetime
-
-class EncryptedBlob(BaseModel):
-    alg: str
-    iv: str
-    ct: str
-
-class Item(BaseModel):
-    id: str
-    user_id: str
-    app: str
-    username: str
-    url: str | None
-    category: str
-    password: EncryptedBlob
-    strength: Literal["critical","weak","fair","strong","elite"]
-    entropy: int
-    created_at: datetime
-    updated_at: datetime
-    favorite: bool = False
-    locked: bool = False              # true after a breach/admin flag — item unreadable until rotated
-    compromised_at: datetime | None = None
-    compromise_reason: Literal["breach", "reuse", "admin-flag"] | None = None
-    breach_notified_at: datetime | None = None   # dedupes the auto WhatsApp alert — cleared on rotation
-
-class AuditEvent(BaseModel):
-    id: str
-    ts: datetime
-    actor: str
-    role: str
-    action: str
-    detail: str
-    severity: Literal["info","warn","critical"]
+```text
+X-Aegis-Vault-Authorization: AEGIS-SYNC-<256-bit base64url secret>
 ```
 
-SQLite + SQLModel is plenty for a 2-3 hour build. `verifier` and `password.ct`
-are just opaque strings to you — index by `id`/`user_id`, nothing else.
+The client generates this secret, encrypts it inside the vault profile under
+the random vault key, and holds it only in memory while unlocked. The backend
+stores a keyed HMAC digest, never the plaintext secret. Consequently, stealing
+only the account session permits ciphertext download but not vault mutation.
 
-**On `locked` items:** the frontend already hides reveal/copy for a locked
-item, but that's a UX nicety, not real enforcement — client-side checks can
-be bypassed by anyone with dev tools. If you want this to actually hold up,
-have `GET /api/items` omit the `password` blob (or refuse the request) for
-any item where `locked: true`, and only restore it once `PUT /api/items/:id`
-rotates the password (which should also clear the flag). That way the
-"you must rotate before you can read it again" rule is enforced by the
-server, not just hidden by the UI.
+Profiles and items use monotonically increasing revisions. Clients send
+`expectedRevision`; stale writes receive HTTP `409`. Deletes retain tombstones
+so another client does not resurrect a removed credential.
 
-## CORS / dev
+## Current client coverage
 
-Frontend dev server proxies `/api/*` to `http://127.0.0.1:8000` already
-(see `frontend/vite.config.js`), so just run:
+- Web: connected to account MFA and encrypted synchronization.
+- Chrome extension: local encrypted vault; remote device-token/MFA exchange remains.
+- Desktop assistant: local encrypted vault; remote device-token/MFA exchange remains.
 
-```bash
-uvicorn main:app --reload --port 8000
-```
-
-and hit `/api/health` returning `200 {"ok": true}` — that's the only thing
-the frontend polls to detect you're alive (once you wire the switch below).
-
-## Wiring it in later
-
-Everything currently lives in `frontend/src/lib/vault.js`'s in-memory/
-localStorage store. When you're ready to point it at your API, that's the
-single file to change — every page already calls its exported functions
-(`unlock`, `saveItem`, `allUsers`, `getAudit`, etc.), so no page component
-needs to change.
+The extension and desktop already share the same crypto and item schema, so the
+remaining work is authentication transport and a remote storage adapter—not a
+new encryption format.

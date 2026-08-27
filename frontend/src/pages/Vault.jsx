@@ -182,7 +182,7 @@ export default function Vault() {
                         <ExternalLink size={13} />
                       </a>
                     )}
-                    <button onClick={() => toggleFavorite(item.id)} title="Favourite" className="text-[#4d5f7a] transition hover:text-amber-300">
+                    <button onClick={async () => { const result = await toggleFavorite(item.id); if (result.ok) refresh() }} title="Favourite" className="text-[#4d5f7a] transition hover:text-amber-300">
                       <Star size={13} className={item.favorite ? 'fill-amber-400 text-amber-400' : ''} />
                     </button>
                     <button onClick={() => setEditing(item)} title="Edit" className="text-[#4d5f7a] transition hover:text-sky-300">
@@ -203,7 +203,7 @@ export default function Vault() {
                     <span>Delete {item.app}?</span>
                     <span className="flex shrink-0 gap-1.5">
                       <button
-                        onClick={() => { deleteItem(item.id); setConfirmingDelete(null) }}
+                        onClick={async () => { const result = await deleteItem(item.id); if (result.ok) { setConfirmingDelete(null); refresh() } }}
                         className="rounded-md bg-rose-500 px-2 py-1 text-[10.5px] font-semibold text-white transition hover:brightness-110"
                       >
                         Delete

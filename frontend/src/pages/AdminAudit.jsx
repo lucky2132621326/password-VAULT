@@ -43,7 +43,7 @@ export default function AdminAudit() {
   }
 
   const warns = log.filter((e) => e.severity === 'warn').length
-  const fails = log.filter((e) => e.action === 'auth.failed').length
+  const fails = log.filter((e) => e.action === 'auth.failed' || e.action === 'vault.unlock_failed').length
   const reveals = log.filter((e) => e.action === 'item.revealed').length
 
   return (
@@ -51,7 +51,7 @@ export default function AdminAudit() {
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <Kpi icon={ScrollText}  label="Total Events"    value={log.length}  sub="this session" />
         <Kpi icon={AlertTriangle} label="Warnings"      value={warns}       sub="elevated actions" tone="warn" />
-        <Kpi icon={ShieldAlert} label="Failed Unlocks"  value={fails}       sub="wrong master password" tone="danger" />
+        <Kpi icon={ShieldAlert} label="Failed Vault Unlocks" value={fails} sub="wrong vault password" tone="danger" />
         <Kpi icon={Info}        label="Secret Reveals"  value={reveals}     sub="plaintext displayed" />
       </div>
 

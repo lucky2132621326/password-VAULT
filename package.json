@@ -11,11 +11,14 @@
   ],
   "scripts": {
     "test": "npm run test --workspaces --if-present",
+    "test:backend": "python -m pytest backend/tests -q",
     "test:shared": "npm run test -w @aegis/shared",
     "test:extension": "npm run test -w @aegis/chrome-extension",
     "test:desktop": "npm run test -w @aegis/desktop",
     "build:web": "npm run build -w frontend",
     "build:extension": "npm run build -w @aegis/chrome-extension",
-    "build:desktop:renderer": "npm run build -w @aegis/desktop"
+    "build:desktop:renderer": "npm run build -w @aegis/desktop",
+    "dev:backend": "python -m uvicorn backend.main:app --reload --port 8000",
+    "dev:web": "npm run dev -w frontend"
   }
 }

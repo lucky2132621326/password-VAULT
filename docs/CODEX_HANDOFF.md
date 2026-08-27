@@ -9,14 +9,15 @@ self-contained on purpose.
 
 ## 0. What AEGIS is (30-second orientation)
 
-AEGIS is a zero-knowledge password vault. Master passwords never leave the
-client; keys are derived locally via PBKDF2-HMAC-SHA256 (600k iterations);
-credentials are encrypted with AES-256-GCM before persistence; the server
-(and admins) can only ever see ciphertext + non-reversible metadata.
+AEGIS is a zero-knowledge password vault. Account authentication uses an
+Argon2id-hashed password plus Google Authenticator-compatible TOTP. Vault
+master passwords never leave the client; PBKDF2-HMAC-SHA256 (600k) unwraps
+a random AES-256 vault key locally. Credentials use AES-256-GCM with
+user/item authenticated context; the server and admins have no decrypt path.
 
 Three clients exist:
-1. **`frontend/`** — the original React web app. **Fully built, tested,
-   working. Do not modify it unless a bug is found that traces back to it.**
+1. **`frontend/`** — React web app with account registration, Authenticator
+   enrollment, TOTP/recovery login, and a separate local vault unlock.
 2. **`apps/chrome-extension/`** — a Manifest V3 extension. Built, unit-tested
    (46 tests), builds to a loadable unpacked extension. **Never loaded into
    a real Chrome browser.**
@@ -29,7 +30,7 @@ Three clients exist:
 
 Shared logic lives in **`packages/shared/`** — canonical crypto, strength
 analysis, credential schema, and a `LocalVaultClient` class both new clients
-build on. 35 unit tests.
+   build on. 41 unit tests.
 
 Read `docs/PROJECT_OVERVIEW.md`, `docs/THREAT_MODEL.md`, and
 `docs/LIMITATIONS.md` now if you have not already — `LIMITATIONS.md`
@@ -43,7 +44,7 @@ list of what this handoff exists to close out.
 These are the properties the entire project is built to demonstrate. Every
 task below must preserve them:
 
-1. **Never make the master password or derived key leave the client**, in
+1. **Never make the vault master password, random vault key, or vault recovery key leave the client**, in
    any form — not in a log, not in a network payload, not in a crash report.
 2. **Never add a decrypt path for admins.** The admin registry in the web
    app shows real ciphertext and a genuinely-failing decrypt attempt — do
@@ -346,15 +347,17 @@ then re-run `npm test` to confirm nothing regressed.
 
 ---
 
-## 7. Phase 6 — Backend integration (only once the backend exists)
+## 7. Phase 6 — Remaining extension/desktop backend integration
 
-This depends on the other team member's FastAPI backend
-(`docs/BACKEND_PROMPT.md`). Do not start this until `GET /api/health`
-returns `200 {"ok": true}` from a running backend.
+The FastAPI account-authentication and encrypted-item backend now exists under
+`backend/`. The web client uses its versioned ciphertext endpoints. The
+remaining phase is connecting extension/desktop to account MFA and that API.
+Preserve the existing auth/vault boundary and unlock-derived write
+authorization; do not reintroduce the old master-password-derived verifier.
 
 ### 7.1 What changes
 
-Only `packages/shared/src/vault-client.js`'s `LocalVaultClient` needs a
+`packages/shared/src/vault-client.js`'s `LocalVaultClient` needs a
 sibling `RemoteVaultClient` (or a mode flag) that swaps the `storageAdapter`
 calls for `fetch` calls to the backend endpoints listed in
 `BACKEND_PROMPT.md`. **No page/component in `frontend/`, `apps/chrome-
@@ -368,12 +371,11 @@ etc.), which is the entire point of that abstraction.
 1. Confirm the backend's `Item` JSON shape matches
    `packages/shared/src/credential-schema.js` exactly (field names,
    optionality).
-2. Add auth token handling (the backend issues a JWT on
-   `/api/auth/verify`) — store it in memory alongside the session, same
-   lifecycle as the derived key (dies on lock).
-3. Swap one client at a time, starting with the web app (lowest risk,
-   easiest to verify), confirming existing accounts/credentials still work
-   before touching the extension or desktop app.
+2. Reuse the existing HttpOnly session cookie for the web client. Design a
+   separate short-lived device/session-token exchange for extension/desktop;
+   never persist it beside vault keys or let it bypass local vault unlock.
+3. The web swap is complete. Add extension next, then desktop, confirming
+   existing local accounts/credentials still work at each step.
 4. Once all three point at the backend, verify the actual cross-client sync
    claim: save a credential in the extension, confirm it appears in the
    web app and desktop app without re-entering it.
@@ -381,11 +383,11 @@ etc.), which is the entire point of that abstraction.
 ### 7.3 Acceptance
 
 - [ ] A credential created in any one client is readable in the other two
-- [ ] Existing local-only vault data has a documented migration path (or an
+- [x] Existing web local-only vault data has an upload migration path
+- [ ] Existing extension/desktop local-only vault data has a documented migration path (or an
       explicit "local vaults are not migrated" note if that's the decision)
-- [ ] `npm test` still green after the swap
-- [ ] `docs/LIMITATIONS.md`'s "three clients do not yet share one vault"
-      section is rewritten to reflect the new reality
+- [x] `npm test` is green after the web swap
+- [x] `docs/LIMITATIONS.md` distinguishes implemented web sync from remaining clients
 
 ---
 
@@ -396,6 +398,8 @@ after you. Append, don't rewrite history.
 
 ```
 [date] — [what you did] — [what's still open]
+2026-08-27 — Added FastAPI Argon2id + TOTP account authentication, encrypted TOTP seeds, one-use/replay-protected challenges and MFA recovery codes, HttpOnly sessions, throttling, the web enrollment/login flow, wrapped random vault keys, user-held vault recovery with key rotation, credential AAD binding, legacy local-vault migration, and security regression tests. Updated Electron/build dependencies. — Still open: encrypted-item backend endpoints/sync; extension and desktop account-MFA integration; shared production rate limiter; passkeys; live Chrome/.NET verification.
+2026-08-27 — Added authenticated wrapped-profile and encrypted-item APIs, per-user ownership, unlock-derived vault-write authorization, optimistic revisions, deletion tombstones, web ciphertext hydration/migration/CRUD sync, 5 backend vault tests, 3 frontend transport tests, and live HTTP verification. — Still open: extension/desktop account-MFA + remote adapters; shared production rate limiter; passkeys; live Chrome/.NET verification.
 ```
 
 ---
@@ -404,6 +408,7 @@ after you. Append, don't rewrite history.
 
 ```bash
 npm test                          # all JS tests (must stay green)
+npm run test:backend              # FastAPI auth security tests
 npm run build:web                 # frontend must never regress
 npm run build:extension           # rebuild before every reload
 npm run test:desktop              # after any electron/main change

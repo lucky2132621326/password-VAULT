@@ -88,6 +88,7 @@ function Unlock({ onUnlocked }) {
   const [masterPassword, setMasterPassword] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [recoveryKey, setRecoveryKey] = useState('')
 
   async function submit(e) {
     e.preventDefault()
@@ -96,7 +97,22 @@ function Unlock({ onUnlocked }) {
     const res = await invoke('desktop/unlock', { username, masterPassword })
     setBusy(false)
     if (!res.ok) { setError(res.error); return }
+    if (res.recoveryKey) { setRecoveryKey(res.recoveryKey); return }
     onUnlocked()
+  }
+
+  if (recoveryKey) {
+    return (
+      <div style={{ padding: 24 }}>
+        <h1 style={{ fontSize: 15, letterSpacing: '.14em', color: '#fbbf24' }}>SAVE RECOVERY KEY</h1>
+        <p style={{ color: '#9fb0c9', fontSize: 12, lineHeight: 1.5 }}>
+          This key is shown once. Store it offline; anyone holding it can recover this local vault.
+        </p>
+        <div style={{ ...fieldStyle, wordBreak: 'break-all', fontFamily: 'ui-monospace, monospace', marginTop: 12 }}>{recoveryKey}</div>
+        <button style={smallButtonStyle} onClick={() => navigator.clipboard.writeText(recoveryKey)}>Copy recovery key</button>
+        <button style={{ ...primaryButtonStyle, width: '100%', marginTop: 10 }} onClick={onUnlocked}>I stored it safely</button>
+      </div>
+    )
   }
 
   return (

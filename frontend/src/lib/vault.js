@@ -2,13 +2,18 @@
 // Holds the encrypted database + the in-memory session. Deliberately plain:
 // a module-level store with a subscribe hook, no state library needed.
 //
-// What is persisted:  ciphertext, salts, verifiers, non-reversible metadata.
-// What is NEVER persisted: the master password, the derived AES key, plaintext.
+// What is persisted: ciphertext, wrapped random vault keys, salts, metadata.
+// What is NEVER persisted: the vault master password, recovery key, vault key, plaintext.
 
-import { deriveKey, encryptField, decryptField, b64, randomBytes, DEMO_BREACHED_PASSWORDS } from './crypto'
+import {
+  deriveKey, createVaultProfile, unlockVaultProfile, unlockVaultSyncSecret, provisionVaultSyncSecret,
+  recoverAndRewrapVaultProfile, credentialAad,
+  encryptField, decryptField, b64, randomBytes, DEMO_BREACHED_PASSWORDS,
+} from './crypto'
 import { DEFAULT_POLICY } from './config'
 import { analyze } from './strength'
 import { sendBreachAlert } from './alerts'
+import { deleteEncryptedItem, getEncryptedVault, putEncryptedItem, putVaultProfile } from './vault-api'
 
 const DB_KEY = 'aegis.db.v1'
 
@@ -22,6 +27,7 @@ let state = {
 
 export const subscribe = (fn) => { listeners.add(fn); return () => listeners.delete(fn) }
 export const getState = () => state
+export const hasLocalVault = (username) => state.db.users.some((user) => user.username === String(username).trim().toLowerCase())
 
 function set(patch) {
   state = { ...state, ...patch }
@@ -43,6 +49,92 @@ function load() {
 
 const uid = () => b64(randomBytes(9)).replace(/[^a-zA-Z0-9]/g, '').slice(0, 10)
 const now = () => new Date().toISOString()
+export const MIN_NEW_VAULT_PASSWORD_LENGTH = 14
+
+const syncedItem = (item) => ({
+  app: item.app,
+  username: item.username,
+  url: item.url ?? '',
+  category: item.category,
+  password: item.password,
+  strength: item.strength,
+  entropy: Math.round(item.entropy),
+  createdAt: item.createdAt,
+  updatedAt: item.updatedAt,
+  favorite: !!item.favorite,
+  locked: !!item.locked,
+  compromisedAt: item.compromisedAt ?? null,
+  compromiseReason: item.compromiseReason ?? null,
+  breachNotifiedAt: item.breachNotifiedAt ?? null,
+})
+
+const sameVaultProfile = (left, right) => Boolean(left && right
+  && left.version === right.version
+  && left.salt === right.salt
+  && left.wrappedVaultKey?.iv === right.wrappedVaultKey?.iv
+  && left.wrappedVaultKey?.ct === right.wrappedVaultKey?.ct
+  && left.recoveryWrappedVaultKey?.iv === right.recoveryWrappedVaultKey?.iv
+  && left.recoveryWrappedVaultKey?.ct === right.recoveryWrappedVaultKey?.ct
+  && left.wrappedSyncSecret?.iv === right.wrappedSyncSecret?.iv
+  && left.wrappedSyncSecret?.ct === right.wrappedSyncSecret?.ct)
+
+async function uploadItem(item, syncSecret = state.session?.syncSecret) {
+  if (!syncSecret) return { ok: false, error: 'Unlock the vault before changing synchronized data' }
+  const result = await putEncryptedItem(item.id, syncedItem(item), item.syncRevision ?? 0, syncSecret)
+  if (result.ok) item.syncRevision = result.revision
+  return result
+}
+
+// Hydrate ciphertext before asking for the vault master password. The server
+// is authoritative for records it already knows; a pre-backend local vault is
+// uploaded once without ever decrypting it on the server.
+export async function prepareVault(accountProfile) {
+  if (!accountProfile?.username) return { ok: false, error: 'Account authentication required' }
+  const remote = await getEncryptedVault()
+  if (!remote.ok) return remote
+
+  const uname = accountProfile.username.trim().toLowerCase()
+  let user = state.db.users.find((entry) => entry.username === uname)
+  const remoteProfile = remote.profile
+
+  if (remoteProfile) {
+    const sameProfile = sameVaultProfile(user?.vaultProfile, remoteProfile.profile)
+    if (!user) {
+      user = {
+        id: accountProfile.id, username: uname, name: accountProfile.name, role: accountProfile.role,
+        vaultProfile: remoteProfile.profile, vaultRevision: remoteProfile.revision,
+        createdAt: now(), status: 'active', mfa: true, lastSeen: now(), phone: '',
+      }
+      state.db.users.push(user)
+    } else {
+      user.vaultProfile = remoteProfile.profile
+      user.vaultRevision = remoteProfile.revision
+      user.name = accountProfile.name
+      user.role = accountProfile.role
+    }
+
+    const otherItems = state.db.items.filter((entry) => entry.userId !== user.id)
+    const unsynced = sameProfile
+      ? state.db.items.filter((entry) => entry.userId === user.id && entry.syncRevision == null)
+      : []
+    const tombstones = new Set(remote.items.filter((entry) => entry.deleted).map((entry) => entry.id))
+    const live = remote.items
+      .filter((entry) => !entry.deleted)
+      .map((entry) => ({ id: entry.id, userId: user.id, ...entry.item, syncRevision: entry.revision }))
+    const remoteIds = new Set(remote.items.map((entry) => entry.id))
+    state.db.items = [
+      ...otherItems,
+      ...live,
+      ...unsynced.filter((entry) => !remoteIds.has(entry.id) && !tombstones.has(entry.id)),
+    ]
+    persist()
+    return { ok: true, remote: true }
+  }
+
+  // A local pre-backend vault cannot be uploaded until its independent
+  // master password decrypts the sync authorization secret.
+  return { ok: true, remote: false }
+}
 
 // ─── Audit log ────────────────────────────────────────────────────────────
 export function audit(action, detail = '', severity = 'info') {
@@ -83,10 +175,11 @@ const SEED_ITEMS = [
 async function seedFor(user, key) {
   const created = []
   for (const s of SEED_ITEMS) {
-    const blob = await encryptField(key, s.password)
+    const itemId = uid()
+    const blob = await encryptField(key, s.password, credentialAad(user.id, itemId))
     const a = analyze(s.password)
     created.push({
-      id: uid(),
+      id: itemId,
       userId: user.id,
       app: s.app,
       username: s.username,
@@ -106,52 +199,172 @@ async function seedFor(user, key) {
 
 // ─── Unlock / lock ────────────────────────────────────────────────────────
 
-export async function unlock(username, masterPassword) {
+export async function unlock(username, masterPassword, accountProfile) {
   const uname = username.trim().toLowerCase()
   let user = state.db.users.find((u) => u.username === uname)
 
-  const demo = DEMO_ACCOUNTS.find((d) => d.username === uname)
+  if (!accountProfile || accountProfile.username !== uname) {
+    return { ok: false, error: 'Account authentication required before vault unlock' }
+  }
 
-  // First-ever unlock of a demo account: provision it now.
-  if (!user && demo) {
-    if (masterPassword !== demo.master) {
-      audit('auth.failed', `Unknown account or wrong master password for "${uname}"`, 'warn')
-      return { ok: false, error: 'Invalid credentials' }
+  const prepared = await prepareVault(accountProfile)
+  if (!prepared.ok) return { ok: false, error: prepared.error || 'Encrypted vault synchronization failed' }
+  user = state.db.users.find((u) => u.username === uname)
+
+  // Account creation and vault creation are independent. The backend account
+  // owns no decryption material; this profile is provisioned only after MFA.
+  if (!user) {
+    if (String(masterPassword).length < MIN_NEW_VAULT_PASSWORD_LENGTH) {
+      return { ok: false, error: `New vault master password must be at least ${MIN_NEW_VAULT_PASSWORD_LENGTH} characters` }
     }
-    const { key, salt, verifier } = await deriveKey(masterPassword)
+    const created = await createVaultProfile(masterPassword)
     user = {
-      id: uid(), username: demo.username, name: demo.name, role: demo.role,
-      salt, verifier, createdAt: now(), status: 'active', mfa: true, lastSeen: now(),
-      phone: demo.phone ?? '',
+      id: accountProfile.id || uid(), username: uname, name: accountProfile.name,
+      role: accountProfile.role, vaultProfile: created.profile,
+      createdAt: now(), status: 'active', mfa: true, lastSeen: now(), phone: '',
     }
+    const stored = await putVaultProfile(created.profile, 0, created.syncSecret)
+    if (!stored.ok) return { ok: false, error: stored.error || 'Could not create encrypted vault' }
+    user.vaultRevision = stored.revision
     state.db.users.push(user)
-
-    if (demo.role === 'user' && !state.db.seeded) {
-      state.db.items.push(...(await seedFor(user, key)))
-      state.db.seeded = true
-    }
     persist()
-    set({ session: { userId: user.id, username: user.username, name: user.name, role: user.role, key, unlockedAt: Date.now() }, locked: false })
-    audit('vault.unlocked', `Key derived — PBKDF2 600k iterations`, 'info')
+    set({
+      session: {
+        userId: user.id, username: user.username, name: user.name, role: user.role,
+        key: created.key, syncSecret: created.syncSecret,
+        unlockedAt: Date.now(), pendingRecoveryKey: created.recoveryKey,
+      },
+      locked: false,
+    })
+    audit('vault.unlocked', 'Random AES-256 vault key created and wrapped locally', 'info')
+    return { ok: true, user, recoveryKey: created.recoveryKey }
+  }
+
+  user.name = accountProfile.name
+  user.role = accountProfile.role
+  user.mfa = true
+
+  if (user.vaultProfile) {
+    const key = await unlockVaultProfile(masterPassword, user.vaultProfile)
+    if (!key) {
+      audit('vault.unlock_failed', `Wrong vault master password for "${uname}"`, 'warn')
+      return { ok: false, error: 'Invalid vault master password' }
+    }
+    let syncSecret = await unlockVaultSyncSecret(key, user.vaultProfile)
+    if (!syncSecret) {
+      const provisioned = await provisionVaultSyncSecret(key, user.vaultProfile)
+      user.vaultProfile = provisioned.profile
+      syncSecret = provisioned.syncSecret
+    }
+    let legacyKey = null
+    if (user.legacy?.salt && user.legacy?.verifier) {
+      const legacy = await deriveKey(masterPassword, user.legacy.salt)
+      if (legacy.verifier === user.legacy.verifier) legacyKey = legacy.key
+    }
+    set({ session: { userId: user.id, username: user.username, name: user.name, role: user.role, key, legacyKey, syncSecret, unlockedAt: Date.now() }, locked: false })
+    if (legacyKey) await completeLegacyMigration(user)
+    if (!prepared.remote) {
+      const stored = await putVaultProfile(user.vaultProfile, user.vaultRevision ?? 0, syncSecret)
+      if (!stored.ok) {
+        lock('profile-sync-failed')
+        return { ok: false, error: stored.error || 'Could not synchronize vault profile' }
+      }
+      user.vaultRevision = stored.revision
+      for (const item of state.db.items.filter((entry) => entry.userId === user.id)) {
+        const result = await uploadItem(item, syncSecret)
+        if (!result.ok) {
+          lock('item-sync-failed')
+          return { ok: false, error: result.error || 'Could not synchronize vault items' }
+        }
+      }
+    }
+    user.lastSeen = now()
+    persist()
+    audit('vault.unlocked', 'Random vault key unwrapped locally after account MFA', 'info')
     return { ok: true, user }
   }
 
-  if (!user) {
-    audit('auth.failed', `No such account "${uname}"`, 'warn')
-    return { ok: false, error: 'Invalid credentials' }
+  // One-time migration for databases written by the original direct-key design.
+  const legacy = await deriveKey(masterPassword, user.salt)
+  if (legacy.verifier !== user.verifier) {
+    audit('vault.unlock_failed', `Wrong vault master password for "${uname}"`, 'warn')
+    return { ok: false, error: 'Invalid vault master password' }
   }
-
-  const { key, verifier } = await deriveKey(masterPassword, user.salt)
-  if (verifier !== user.verifier) {
-    audit('auth.failed', `Wrong master password for "${uname}"`, 'warn')
-    return { ok: false, error: 'Invalid credentials' }
+  const created = await createVaultProfile(masterPassword)
+  user.vaultProfile = created.profile
+  user.legacy = { salt: user.salt, verifier: user.verifier }
+  persist()
+  set({
+    session: {
+      userId: user.id, username: user.username, name: user.name, role: user.role,
+      key: created.key, legacyKey: legacy.key, syncSecret: created.syncSecret,
+      unlockedAt: Date.now(), pendingRecoveryKey: created.recoveryKey,
+    },
+    locked: false,
+  })
+  await completeLegacyMigration(user)
+  const stored = await putVaultProfile(user.vaultProfile, user.vaultRevision ?? 0, created.syncSecret)
+  if (!stored.ok) {
+    lock('profile-sync-failed')
+    return { ok: false, error: stored.error || 'Could not synchronize migrated vault' }
   }
-
+  user.vaultRevision = stored.revision
+  for (const item of state.db.items.filter((entry) => entry.userId === user.id)) {
+    const result = await uploadItem(item, created.syncSecret)
+    if (!result.ok) {
+      lock('item-sync-failed')
+      return { ok: false, error: result.error || 'Could not synchronize migrated vault items' }
+    }
+  }
   user.lastSeen = now()
   persist()
-  set({ session: { userId: user.id, username: user.username, name: user.name, role: user.role, key, unlockedAt: Date.now() }, locked: false })
-  audit('vault.unlocked', 'Key derived — PBKDF2 600k iterations', 'info')
-  return { ok: true, user }
+  audit('vault.migrated', 'Legacy credentials re-encrypted under a wrapped random vault key', 'info')
+  return { ok: true, user, recoveryKey: created.recoveryKey, migrated: true }
+}
+
+async function completeLegacyMigration(user) {
+  for (const item of state.db.items.filter((entry) => entry.userId === user.id && (entry.password?.v ?? 1) < 2)) {
+    const plaintext = await decryptField(state.session.legacyKey, item.password)
+    if (plaintext == null) throw new Error('Legacy vault migration failed authentication')
+    item.password = await encryptField(state.session.key, plaintext, credentialAad(user.id, item.id))
+  }
+  delete user.salt
+  delete user.verifier
+  delete user.legacy
+  state.session.legacyKey = null
+  persist()
+}
+
+export async function recoverVault(username, recoveryKey, newMasterPassword, accountProfile) {
+  const uname = String(username).trim().toLowerCase()
+  if (!accountProfile || accountProfile.username !== uname) return { ok: false, error: 'Account authentication required' }
+  const user = state.db.users.find((entry) => entry.username === uname)
+  if (!user?.vaultProfile) return { ok: false, error: 'Recovery unavailable' }
+  if (String(newMasterPassword).length < MIN_NEW_VAULT_PASSWORD_LENGTH) {
+    return { ok: false, error: `New vault master password must be at least ${MIN_NEW_VAULT_PASSWORD_LENGTH} characters` }
+  }
+  const recovered = await recoverAndRewrapVaultProfile(recoveryKey, newMasterPassword, user.vaultProfile)
+  if (!recovered) return { ok: false, error: 'Invalid vault recovery key' }
+  const stored = await putVaultProfile(recovered.profile, user.vaultRevision ?? 0, recovered.syncSecret)
+  if (!stored.ok) return { ok: false, error: stored.error || 'Could not rotate the remote vault profile' }
+  user.vaultProfile = recovered.profile
+  user.vaultRevision = stored.revision
+  persist()
+  set({
+    session: {
+      userId: user.id, username: user.username, name: user.name, role: user.role,
+      key: recovered.key, syncSecret: recovered.syncSecret, unlockedAt: Date.now(), recovered: true,
+      pendingRecoveryKey: recovered.recoveryKey,
+    },
+    locked: false,
+  })
+  audit('vault.recovered', 'User-held recovery key unlocked vault and rotated its master-password wrapper', 'warn')
+  return { ok: true, recoveryKey: recovered.recoveryKey }
+}
+
+export function acknowledgeRecoveryKey() {
+  if (!state.session?.pendingRecoveryKey) return
+  set({ session: { ...state.session, pendingRecoveryKey: null } })
 }
 
 export function lock(reason = 'manual') {
@@ -167,7 +380,9 @@ export const itemsForCurrentUser = () =>
 export async function revealPassword(itemId) {
   const item = state.db.items.find((i) => i.id === itemId)
   if (!item || !state.session) return null
-  const pt = await decryptField(state.session.key, item.password)
+  const key = (item.password?.v ?? 1) >= 2 ? state.session.key : state.session.legacyKey
+  if (!key) return null
+  const pt = await decryptField(key, item.password, credentialAad(item.userId, item.id))
   audit('item.revealed', `${item.app} (${item.username})`, 'warn')
   return pt
 }
@@ -178,36 +393,45 @@ export async function decryptAll() {
   const mine = itemsForCurrentUser()
   const out = []
   for (const it of mine) {
-    out.push({ ...it, plaintext: await decryptField(state.session.key, it.password) })
+    const key = (it.password?.v ?? 1) >= 2 ? state.session.key : state.session.legacyKey
+    out.push({ ...it, plaintext: key ? await decryptField(key, it.password, credentialAad(it.userId, it.id)) : null })
   }
   return out
 }
 
 export async function saveItem(draft) {
   if (!state.session) return { ok: false, error: 'Vault locked' }
-  const blob = await encryptField(state.session.key, draft.password)
   const a = analyze(draft.password)
 
   if (draft.id) {
     const item = state.db.items.find((i) => i.id === draft.id)
     if (!item) return { ok: false, error: 'Not found' }
+    const blob = await encryptField(state.session.key, draft.password, credentialAad(item.userId, item.id))
     const wasLocked = item.locked
-    Object.assign(item, {
+    const candidate = { ...item,
       app: draft.app, username: draft.username, url: draft.url, category: draft.category,
       password: blob, strength: a.level, entropy: a.entropy, updatedAt: now(),
       // Setting a new password IS the rotation — clear any compromise lock
       // and let a genuinely new breach re-alert instead of staying suppressed.
       locked: false, compromisedAt: null, compromiseReason: null, breachNotifiedAt: null,
-    })
+    }
+    const synced = await uploadItem(candidate)
+    if (!synced.ok) return { ok: false, error: synced.error || 'Could not synchronize credential' }
+    Object.assign(item, candidate)
     audit('item.updated', `${draft.app} — re-encrypted with a fresh IV${wasLocked ? ' (rotation cleared the compromise lock)' : ''}`, 'info')
   } else {
-    state.db.items.push({
-      id: uid(), userId: state.session.userId,
+    const itemId = uid()
+    const blob = await encryptField(state.session.key, draft.password, credentialAad(state.session.userId, itemId))
+    const item = {
+      id: itemId, userId: state.session.userId,
       app: draft.app, username: draft.username, url: draft.url, category: draft.category,
       password: blob, strength: a.level, entropy: a.entropy,
       createdAt: now(), updatedAt: now(), favorite: false,
       locked: false, compromisedAt: null, compromiseReason: null, breachNotifiedAt: null,
-    })
+    }
+    const synced = await uploadItem(item)
+    if (!synced.ok) return { ok: false, error: synced.error || 'Could not synchronize credential' }
+    state.db.items.push(item)
     audit('item.created', `${draft.app} (${draft.username})`, 'info')
   }
   persist()
@@ -233,16 +457,26 @@ export async function simulateBreach(itemId) {
   return res
 }
 
-export function deleteItem(id) {
+export async function deleteItem(id) {
   const item = state.db.items.find((i) => i.id === id)
+  if (!item) return { ok: false, error: 'Not found' }
+  const result = await deleteEncryptedItem(id, item.syncRevision ?? 0, state.session?.syncSecret)
+  if (!result.ok) return { ok: false, error: result.error || 'Could not synchronize deletion' }
   state.db.items = state.db.items.filter((i) => i.id !== id)
   audit('item.deleted', item ? `${item.app} (${item.username})` : id, 'warn')
   persist()
+  return { ok: true }
 }
 
-export function toggleFavorite(id) {
+export async function toggleFavorite(id) {
   const item = state.db.items.find((i) => i.id === id)
-  if (item) { item.favorite = !item.favorite; persist() }
+  if (!item) return { ok: false, error: 'Not found' }
+  const candidate = { ...item, favorite: !item.favorite, updatedAt: now() }
+  const result = await uploadItem(candidate)
+  if (!result.ok) return { ok: false, error: result.error || 'Could not synchronize favorite' }
+  Object.assign(item, candidate)
+  persist()
+  return { ok: true }
 }
 
 // ─── Admin operations (metadata only — no plaintext access, by design) ─────
@@ -361,4 +595,54 @@ export function resetDemo() {
   localStorage.removeItem(DB_KEY)
   state = { db: load(), session: null, locked: true }
   listeners.forEach((f) => f(state))
+}
+
+// Start a local demo session without contacting the backend. Creates a
+// local demo user, seeds demo items, and unlocks the vault using the
+// built-in demo master password. Useful for offline demos when the
+// authenticator/backend is unavailable.
+export async function enterDemo(username = null) {
+  try {
+    console.debug('enterDemo() invoked, username=', username)
+    const demo = (username && DEMO_ACCOUNTS.find((d) => d.username === username)) || DEMO_ACCOUNTS[0]
+    const uname = String(demo.username).trim().toLowerCase()
+    let user = state.db.users.find((u) => u.username === uname)
+
+    if (!user) {
+      const created = await createVaultProfile(demo.master)
+      user = {
+        id: uid(), username: uname, name: demo.name, role: demo.role,
+        vaultProfile: created.profile, createdAt: now(), status: 'active', mfa: false, lastSeen: now(), phone: demo.phone,
+      }
+      state.db.users.push(user)
+
+      const seeded = await seedFor(user, created.key)
+      for (const it of seeded) state.db.items.push(it)
+      persist()
+
+      set({
+        session: {
+          userId: user.id, username: user.username, name: user.name, role: user.role,
+          key: created.key, syncSecret: created.syncSecret, unlockedAt: Date.now(), pendingRecoveryKey: created.recoveryKey,
+        },
+        locked: false,
+      })
+      audit('demo.entered', `Demo user ${user.username} started`, 'info')
+      console.debug('enterDemo() created demo user', user.username)
+      return { ok: true, user, recoveryKey: created.recoveryKey }
+    }
+
+    // If a local demo user already exists, attempt a normal unlock with the
+    // demo master password to restore a session (this reuses existing logic).
+    console.debug('enterDemo() found existing user, unlocking', uname)
+    const res = await unlock(uname, demo.master, { id: user.id, username: user.username, name: user.name, role: user.role })
+    if (!res || !res.ok) {
+      console.warn('enterDemo() unlock failed', res)
+      return { ok: false, error: res?.error || 'Demo unlock failed' }
+    }
+    return res
+  } catch (err) {
+    console.error('enterDemo() error', err)
+    return { ok: false, error: err?.message || String(err) }
+  }
 }

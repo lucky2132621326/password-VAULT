@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { LocalVaultClient, VaultLockedError } from '../src/vault-client.js'
+import { deriveKey, encryptField } from '../src/crypto.js'
 import { makeMemoryStorage } from './storage-fixture.js'
 
 let storage, client
@@ -13,6 +14,11 @@ describe('unlock / lock lifecycle', () => {
   it('provisions a local profile on first unlock and reports unlocked status', async () => {
     const res = await client.unlock('alice', 'Demo@Vault2026')
     expect(res.ok).toBe(true)
+    expect(res.recoveryKey).toMatch(/^AEGIS-/)
+    const persisted = await storage.get('aegis.local.users')
+    expect(persisted[0].vaultProfile.version).toBe(2)
+    expect(persisted[0].verifier).toBeUndefined()
+    expect(JSON.stringify(storage._dump())).not.toContain(res.recoveryKey)
     expect(client.getStatus().locked).toBe(false)
   })
 
@@ -29,6 +35,35 @@ describe('unlock / lock lifecycle', () => {
     await client.lock('test')
     const res = await client.unlock('alice', 'Demo@Vault2026')
     expect(res.ok).toBe(true)
+  })
+
+  it('recovery rotates the old master password and the old recovery key', async () => {
+    const first = await client.unlock('alice', 'old-vault-master')
+    await client.lock('test')
+    const recovered = await client.recover('alice', first.recoveryKey, 'new-vault-master')
+    expect(recovered.ok).toBe(true)
+    expect(recovered.recoveryKey).not.toBe(first.recoveryKey)
+    await client.lock('test')
+    expect((await client.unlock('alice', 'old-vault-master')).ok).toBe(false)
+    expect((await client.unlock('alice', 'new-vault-master')).ok).toBe(true)
+    await client.lock('test')
+    expect((await client.recover('alice', first.recoveryKey, 'another-master')).ok).toBe(false)
+  })
+
+  it('migrates a version 1 direct-key profile and its ciphertext without data loss', async () => {
+    const legacy = await deriveKey('legacy-master')
+    const legacyBlob = await encryptField(legacy.key, 'legacy-secret')
+    await storage.set('aegis.local.users', [{ id: 'legacy-user', username: 'alice', salt: legacy.salt, verifier: legacy.verifier }])
+    await storage.set('aegis.local.items', [{ id: 'legacy-item', userId: 'legacy-user', app: 'Legacy', username: 'alice', password: legacyBlob }])
+
+    const result = await client.unlock('alice', 'legacy-master')
+    expect(result.migrated).toBe(true)
+    expect(result.recoveryKey).toMatch(/^AEGIS-/)
+    expect(await client.revealCredential('legacy-item')).toBe('legacy-secret')
+    const users = await storage.get('aegis.local.users')
+    const items = await storage.get('aegis.local.items')
+    expect(users[0].verifier).toBeUndefined()
+    expect(items[0].password.v).toBe(2)
   })
 
   it('throws VaultLockedError for vault operations while locked', async () => {
@@ -49,6 +84,15 @@ describe('credential create / update / reveal', () => {
     const { id } = await client.createCredential({ app: 'GitHub', username: 'alice', password: 'S3cr3t!Passphrase', url: 'https://github.com' })
     const revealed = await client.revealCredential(id)
     expect(revealed).toBe('S3cr3t!Passphrase')
+  })
+
+  it('rejects ciphertext copied into a different item identity', async () => {
+    const first = await client.createCredential({ app: 'One', username: 'alice', password: 'first-secret' })
+    const second = await client.createCredential({ app: 'Two', username: 'alice', password: 'second-secret' })
+    const items = await storage.get('aegis.local.items')
+    items.find((item) => item.id === second.id).password = items.find((item) => item.id === first.id).password
+    await storage.set('aegis.local.items', items)
+    expect(await client.revealCredential(second.id)).toBeNull()
   })
 
   it('rotating the password clears a compromise lock', async () => {

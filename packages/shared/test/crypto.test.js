@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { deriveKey, encryptField, decryptField, generatePassword } from '../src/crypto.js'
+import {
+  createVaultProfile, credentialAad, decryptField, deriveKey, encryptField,
+  generatePassword, recoverAndRewrapVaultProfile, recoverVaultProfile, unlockVaultProfile,
+  unlockVaultSyncSecret,
+} from '../src/crypto.js'
 
 describe('crypto: key derivation', () => {
   it('derives the same key/verifier from the same password+salt, and a different verifier for a wrong password', async () => {
@@ -41,6 +45,45 @@ describe('crypto: AES-256-GCM field encryption', () => {
     const tampered = { ...blob, ct: blob.ct.slice(0, -4) + 'AAAA' }
     const result = await decryptField(key, tampered)
     expect(result).toBeNull()
+  })
+
+  it('binds version 2 ciphertext to its user and item identity', async () => {
+    const { key } = await deriveKey('owner-password-3')
+    const context = credentialAad('user-a', 'item-1')
+    const blob = await encryptField(key, 'bound secret', context)
+    expect(await decryptField(key, blob, context)).toBe('bound secret')
+    expect(await decryptField(key, blob, credentialAad('user-a', 'item-2'))).toBeNull()
+    expect(await decryptField(key, blob, credentialAad('user-b', 'item-1'))).toBeNull()
+  })
+})
+
+describe('crypto: wrapped random vault key', () => {
+  it('keeps account access independent from vault decryption', async () => {
+    const created = await createVaultProfile('vault-master-password')
+    expect(created.profile).not.toHaveProperty('verifier')
+    expect(JSON.stringify(created.profile)).not.toContain(created.recoveryKey)
+    expect(JSON.stringify(created.profile)).not.toContain(created.syncSecret)
+
+    const unlocked = await unlockVaultProfile('vault-master-password', created.profile)
+    const wrong = await unlockVaultProfile('account-password-is-not-the-vault-password', created.profile)
+    expect(unlocked).not.toBeNull()
+    expect(wrong).toBeNull()
+    expect(await unlockVaultSyncSecret(unlocked, created.profile)).toBe(created.syncSecret)
+
+    const blob = await encryptField(created.key, 'inside-vault', credentialAad('u', 'i'))
+    expect(await decryptField(unlocked, blob, credentialAad('u', 'i'))).toBe('inside-vault')
+  })
+
+  it('recovers and rotates both the master-password wrapper and recovery key', async () => {
+    const created = await createVaultProfile('old-master-password')
+    const recovered = await recoverAndRewrapVaultProfile(created.recoveryKey, 'new-master-password', created.profile)
+    expect(recovered).not.toBeNull()
+    expect(recovered.recoveryKey).not.toBe(created.recoveryKey)
+    expect(recovered.syncSecret).toBe(created.syncSecret)
+    expect(await unlockVaultProfile('old-master-password', recovered.profile)).toBeNull()
+    expect(await unlockVaultProfile('new-master-password', recovered.profile)).not.toBeNull()
+    expect(await recoverVaultProfile(created.recoveryKey, recovered.profile)).toBeNull()
+    expect(await recoverVaultProfile(recovered.recoveryKey, recovered.profile)).not.toBeNull()
   })
 })
 

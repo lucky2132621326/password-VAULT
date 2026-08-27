@@ -34,6 +34,7 @@ async function render() {
       const masterPassword = document.getElementById('p').value
       const res = await send(ACTIONS.UNLOCK, { username, masterPassword })
       if (!res.ok) { document.getElementById('err').textContent = res.error; return }
+      if (res.recoveryKey) { renderRecoveryKey(res.recoveryKey); return }
       render()
     })
     return
@@ -70,6 +71,24 @@ async function render() {
       window.close()
     })
   })
+}
+
+function renderRecoveryKey(recoveryKey) {
+  root.innerHTML = `
+    <h1>AEGIS</h1>
+    <div class="status"><span class="dot unlocked"></span> Save vault recovery key</div>
+    <div class="error" style="color:#fef3c7;border-color:#f59e0b55;background:#f59e0b11">
+      This is shown once. Store it offline; anyone holding it can recover this local vault.
+    </div>
+    <div class="field" id="recovery" style="height:auto;word-break:break-all;font-family:monospace">${escapeHtml(recoveryKey)}</div>
+    <button id="copy-recovery">Copy recovery key</button>
+    <button class="primary" id="saved-recovery" style="margin-top:8px">I stored it safely</button>
+  `
+  document.getElementById('copy-recovery').addEventListener('click', async () => {
+    await navigator.clipboard.writeText(recoveryKey)
+    document.getElementById('copy-recovery').textContent = 'Copied'
+  })
+  document.getElementById('saved-recovery').addEventListener('click', render)
 }
 
 render()

@@ -1,10 +1,10 @@
 import { useState } from 'react'
 import {
   ShieldCheck, LayoutDashboard, KeySquare, Wand2, HeartPulse, Users, FileLock2,
-  SlidersHorizontal, ScrollText, Info, Lock, LogOut, Timer, MessageCircle, X, ShieldAlert,
+  SlidersHorizontal, ScrollText, Info, Lock, LogOut, Timer, MessageCircle, X, ShieldAlert, Copy,
 } from 'lucide-react'
 import { APP } from './lib/config'
-import { lock } from './lib/vault'
+import { acknowledgeRecoveryKey, lock } from './lib/vault'
 import { useVault, useAutoLock, useAlertToast } from './lib/hooks'
 
 import Login from './pages/Login'
@@ -181,6 +181,36 @@ function Shell({ session }) {
           <button onClick={dismiss} className="shrink-0 text-[#4d5f7a] transition hover:text-[#e8eefc]">
             <X size={14} />
           </button>
+        </div>
+      )}
+
+      {session.pendingRecoveryKey && (
+        <div className="fixed inset-0 z-[60] grid place-items-center bg-black/75 p-6 backdrop-blur-sm">
+          <div className="w-full max-w-[500px] rounded-2xl border border-amber-400/35 bg-[#0d1424] p-6 shadow-2xl">
+            <h2 className="flex items-center gap-2 text-[15px] font-semibold text-amber-200">
+              <ShieldCheck size={18} /> Save your vault recovery key
+            </h2>
+            <p className="mt-2 text-[12px] leading-5 text-[#9fb0c9]">
+              This key can decrypt your vault if the vault master password is lost. It is shown once, is never sent to the account server, and cannot be recovered by an administrator.
+            </p>
+            <div className="mt-4 break-all rounded-xl border border-amber-400/30 bg-[#070b14] p-4 font-mono text-[13px] leading-6 text-amber-100">
+              {session.pendingRecoveryKey}
+            </div>
+            <button
+              type="button"
+              onClick={() => navigator.clipboard?.writeText(session.pendingRecoveryKey)}
+              className="mt-3 flex items-center gap-2 text-[12px] text-sky-300 hover:text-sky-200"
+            >
+              <Copy size={13} /> Copy recovery key
+            </button>
+            <button
+              type="button"
+              onClick={acknowledgeRecoveryKey}
+              className="mt-5 w-full rounded-lg bg-gradient-to-b from-sky-400 to-sky-500 py-2.5 text-[13px] font-semibold text-[#061019]"
+            >
+              I stored it safely
+            </button>
+          </div>
         </div>
       )}
     </div>
