@@ -253,11 +253,29 @@ def create_app(settings: Settings) -> FastAPI:
         }
 
     def item_response(record: VaultItemRecord):
+        def _is_encrypted_blob(obj: any) -> bool:
+            try:
+                return isinstance(obj, dict) and int(obj.get('v', 0)) >= 2 and isinstance(obj.get('alg'), str) and isinstance(obj.get('iv'), str) and isinstance(obj.get('ct'), str)
+            except Exception:
+                return False
+
+        payload = None
+        if not record.deleted:
+            try:
+                payload = json.loads(record.payload_json)
+            except Exception:
+                payload = None
+            # Defensive: if a payload contains a non-encrypted password (eg. plain string), redact it
+            if payload and not _is_encrypted_blob(payload.get('password')):
+                payload = { **payload }
+                payload['password'] = { 'v': 2, 'alg': 'AES-256-GCM', 'iv': '', 'ct': '' }
+                payload['_plaintextDetected'] = True
+
         return {
             "id": record.item_id,
             "revision": record.revision,
             "deleted": record.deleted,
-            "item": None if record.deleted else json.loads(record.payload_json),
+            "item": None if record.deleted else payload,
             "updatedAt": record.updated_at,
         }
 
@@ -338,7 +356,12 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=409,
                 detail=f"Vault item version conflict; current revision is {current_revision}",
             )
-        encoded = json.dumps(body.item.model_dump(mode="json"), separators=(",", ":"))
+        # Extra defensive validation: ensure the incoming item contains a ciphertext blob
+        item_dict = body.item.model_dump(mode="json")
+        pw = item_dict.get('password')
+        if not (isinstance(pw, dict) and all(k in pw for k in ('v', 'alg', 'iv', 'ct'))):
+            raise HTTPException(status_code=422, detail="Vault items must contain ciphertext-only password blobs")
+        encoded = json.dumps(item_dict, separators=(",", ":"))
         if record is None:
             record = VaultItemRecord(user_id=user.id, item_id=item_id, payload_json=encoded)
         else:
