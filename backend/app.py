@@ -270,6 +270,15 @@ def create_app(settings: Settings) -> FastAPI:
                 payload = { **payload }
                 payload['password'] = { 'v': 2, 'alg': 'AES-256-GCM', 'iv': '', 'ct': '' }
                 payload['_plaintextDetected'] = True
+                # Mark the item as locked/compromised so clients hide the plaintext and force rotation
+                payload['locked'] = True
+                payload['compromiseReason'] = 'admin-flag'
+                try:
+                    payload['compromisedAt'] = utcnow().isoformat()
+                except Exception:
+                    payload['compromisedAt'] = datetime.now(timezone.utc).isoformat()
+                payload['strength'] = 'critical'
+                payload['entropy'] = 0
 
         return {
             "id": record.item_id,
